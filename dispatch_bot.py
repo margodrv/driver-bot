@@ -447,27 +447,29 @@ def _fmt_num(n) -> str:
     return str(n)
 
 
-def build_tariff_preview(tariff: dict, author_line: str = "") -> str:
+def build_tariff_preview(tariff: dict, author_line: str = "", edited_fields: set = frozenset()) -> str:
     lines = []
     if author_line:
         lines.append(author_line)
     lines.append("📋 Тариф по заказу")
 
+    star = lambda keys: " ⭐️" if edited_fields & set(keys) else ""
+
     base = tariff.get("avto_baza")
     if tariff.get("tip_rascheta") == "фикс":
-        lines.append(f"Авто: {_fmt_num(base)} (фикса)")
+        lines.append(f"Авто: {_fmt_num(base)} (фикса){star(['avto', 'tip_rascheta', 'min_chasov'])}")
     elif base is not None:
         min_h = tariff.get("min_chasov")
         dop = _fmt_num(tariff.get("avto_dop_chas"))
         hours_part = f" ({_fmt_num(min_h)}ч)" if min_h is not None else ""
-        lines.append(f"Авто: {_fmt_num(base)}{hours_part}/{dop}")
+        lines.append(f"Авто: {_fmt_num(base)}{hours_part}/{dop}{star(['avto', 'tip_rascheta', 'min_chasov'])}")
 
     gr_base = tariff.get("gruzchiki_baza")
     if gr_base is not None:
         gr_dop = _fmt_num(tariff.get("gruzchiki_dop_chas"))
         # Грузчики всегда на 2ч по подтверждённому бизнес-правилу - это
         # константа, не значение из текста заявки или GPT.
-        lines.append(f"Грузчики: {_fmt_num(gr_base)} (2ч)/{gr_dop}")
+        lines.append(f"Грузчики: {_fmt_num(gr_base)} (2ч)/{gr_dop}{star(['gruzchiki'])}")
 
     kom_avto = tariff.get("kom_avto")
     kom_gruz = tariff.get("kom_gruzchiki")
@@ -479,18 +481,19 @@ def build_tariff_preview(tariff: dict, author_line: str = "") -> str:
         return f"{v}%" if k.get("tip") == "%" else f"{v} грн"
 
     a_str, g_str = kom_str(kom_avto), kom_str(kom_gruz)
+    kom_star = star(["kom_avto", "kom_gruzchiki"])
     if a_str and g_str:
         if a_str == g_str:
-            lines.append(f"Ком. {a_str}")
+            lines.append(f"Ком. {a_str}{kom_star}")
         else:
-            lines.append(f"Ком. авто: {a_str} | грузчики: {g_str}")
+            lines.append(f"Ком. авто: {a_str} | грузчики: {g_str}{kom_star}")
     elif a_str:
-        lines.append(f"Ком. {a_str}")
+        lines.append(f"Ком. {a_str}{kom_star}")
     elif g_str:
-        lines.append(f"Ком. грузчики: {g_str}")
+        lines.append(f"Ком. грузчики: {g_str}{kom_star}")
 
     if tariff.get("platelshik"):
-        lines.append(f"Плательщик: {tariff['platelshik']}")
+        lines.append(f"Плательщик: {tariff['platelshik']}{star(['platelshik'])}")
 
     if not tariff.get("forma_oplaty"):
         lines.append("⚠️ Форма оплаты: не указана")
@@ -607,8 +610,15 @@ def _parse_forma_oplaty(text: str):
 
 
 def _apply_avto(tariff, text):
-    a, b = _parse_two_numbers(text)
-    tariff["avto_baza"], tariff["avto_dop_chas"] = a, b
+    t = text.strip()
+    if "/" in t:
+        a, b = _parse_two_numbers(t)
+        tariff["avto_baza"], tariff["avto_dop_chas"] = a, b
+        tariff["tip_rascheta"] = "почасовка"
+    else:
+        tariff["avto_baza"] = _parse_one_number(t)
+        tariff["avto_dop_chas"] = None
+        tariff["tip_rascheta"] = "фикс"
 
 
 def _apply_min_chasov(tariff, text):
@@ -643,8 +653,8 @@ def _apply_forma_oplaty(tariff, text):
 # field_key -> {label, hint, apply(tariff, text), columns затрагиваемые в Sheets}
 FIELD_DEFS = {
     "avto": {
-        "label": "Авто (база/доп.час)", "hint": "например: 4750/950",
-        "apply": _apply_avto, "columns": ["Авто_база", "Авто_доп_час"],
+        "label": "Авто (база/доп.час)", "hint": "4750/950 - почасовка, или просто 1890 - фикс",
+        "apply": _apply_avto, "columns": ["Авто_база", "Авто_доп_час", "Тип_расчёта"],
     },
     "min_chasov": {
         "label": "Мин. часов", "hint": "например: 3",
@@ -690,6 +700,10 @@ _pending_tariffs: dict[str, dict] = {}
 # order_key -> строка автора/менеджера (нужна, чтобы восстановить её при
 # перерисовке превью после отмены правки или рестарта).
 _order_author_line: dict[str, str] = {}
+
+# order_key -> множество field_key, которые логист уже поправил вручную -
+# используется, чтобы пометить изменённые строки превью звёздочкой ⭐️.
+_order_edited_fields: dict[str, set] = {}
 
 # (chat_id, message_id превью-сообщения бота) -> (order_key, field_key).
 # Заполняется при нажатии кнопки конкретного поля в меню правки, чтобы
@@ -790,6 +804,7 @@ async def handle_tariff_callback(update: Update, context: ContextTypes.DEFAULT_T
             return
         _pending_tariffs.pop(order_key, None)
         _order_author_line.pop(order_key, None)
+        _order_edited_fields.pop(order_key, None)
         log_event("Тариф подтверждён и записан", row=row_num)
         await query.edit_message_text(query.message.text + "\n\n✅ Подтверждено")
 
@@ -804,8 +819,9 @@ async def handle_tariff_callback(update: Update, context: ContextTypes.DEFAULT_T
         row_num = find_row_by_key(sheet, order_key)
         pending = get_or_reparse_tariff(sheet, row_num, order_key) if row_num else {}
         author_line = _order_author_line.get(order_key, "")
+        edited = _order_edited_fields.get(order_key, set())
         await query.edit_message_text(
-            build_tariff_preview(pending, author_line),
+            build_tariff_preview(pending, author_line, edited),
             reply_markup=tariff_level1_keyboard(order_key),
         )
 
@@ -866,6 +882,7 @@ async def handle_tariff_correction_reply(update: Update, context: ContextTypes.D
 
     _pending_tariffs[order_key] = pending
     _awaiting_field_edit.pop(msg_key, None)
+    _order_edited_fields.setdefault(order_key, set()).add(field_key)
 
     new_values = build_tariff_row_values(pending)
     new_str = " / ".join(new_values[c] for c in fdef["columns"] if new_values[c]) or "(пусто)"
@@ -873,11 +890,20 @@ async def handle_tariff_correction_reply(update: Update, context: ContextTypes.D
     log_event(f"Правка поля '{fdef['label']}' записана в Sheets", row=row_num)
 
     author_line = _order_author_line.get(order_key, "")
+    edited = _order_edited_fields.get(order_key, set())
     await replied.edit_text(
-        build_tariff_preview(pending, author_line),
+        build_tariff_preview(pending, author_line, edited),
         reply_markup=tariff_level1_keyboard(order_key),
     )
-    await msg.reply_text(f"✅ Записано в таблицу: {fdef['label']} = {new_str}")
+
+    # Убираем за собой: подтверждение больше не шлём (обновлённое превью
+    # уже всё показывает) и пробуем удалить сообщение логиста со значением
+    # - если у бота нет прав на удаление чужих сообщений в группе, просто
+    # тихо промолчим, это не критично для самого сохранения данных.
+    try:
+        await msg.delete()
+    except Exception as e:
+        logger.info(f"Не удалось удалить сообщение с правкой (нет прав?): {e}")
 
 
 # ---------------------------------------------------------------------------
