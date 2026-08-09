@@ -851,6 +851,15 @@ def _apply_prohody(tariff, text):
     _resolve_neponyatno(tariff)
 
 
+def _apply_ves(tariff, text):
+    v = _parse_one_number(text)
+    if v > 15:
+        raise ValueError(f"{_fmt_num(v)} многовато для веса (обычно до 15 грн/кг) - проверьте цифру")
+    tj = tariff.setdefault("tariff_json", {})
+    tj["ves"] = {"tip": "ploskaya", "stavka": v}
+    _resolve_neponyatno(tariff)
+
+
 # field_key -> {label, hint, apply(tariff, text), columns затрагиваемые в Sheets}
 # Каждое поле правится НЕЗАВИСИМО одним числом - никаких "два числа через
 # /" в одном вводе, чтобы нельзя было случайно стереть соседнее значение,
@@ -912,6 +921,10 @@ FIELD_DEFS = {
         "label": "Проходы", "hint": "например: 150 (грн)",
         "apply": _apply_prohody, "columns": ["Тариф_JSON"],
     },
+    "ves": {
+        "label": "Вес", "hint": "например: 4 (грн/кг, до 15)",
+        "apply": _apply_ves, "columns": ["Тариф_JSON"],
+    },
 }
 
 
@@ -946,15 +959,44 @@ def tariff_level1_keyboard(order_key: str) -> InlineKeyboardMarkup:
     ]])
 
 
+# Раскладка меню правки задана явно (не автоматически по 2) - сгруппирована
+# по смыслу: 🚖 авто, 🏋️‍♀️ грузчики, 💲 деньги/оплата.
+_EDIT_MENU_ROWS = [
+    ["avto_baza", "avto_dop_chas", "min_chasov"],
+    ["km", "dop_tochka", "gidrobort"],
+    ["kom_avto", "kom_gruzchiki"],
+    ["gruzchiki_baza", "gruzchiki_dop_chas"],
+    ["etazhi", "prohody", "ves"],
+    ["platelshik", "forma_oplaty"],
+]
+
+_EDIT_MENU_LABELS = {
+    "avto_baza": "🚖 Авто",
+    "avto_dop_chas": "🚖 Доп час",
+    "min_chasov": "🚖 Мин. часов",
+    "km": "🚖 Км",
+    "dop_tochka": "🚖 Точка",
+    "gidrobort": "🚖 ГБ",
+    "kom_avto": "🚖 Ком авто",
+    "kom_gruzchiki": "🏋️\u200d♀️ Ком Грузчики",
+    "gruzchiki_baza": "🏋️\u200d♀️ Грузчики",
+    "gruzchiki_dop_chas": "🏋️\u200d♀️ Доп час",
+    "etazhi": "🏋️\u200d♀️ Этаж",
+    "prohody": "🏋️\u200d♀️ Проход",
+    "ves": "🏋️\u200d♀️ Вес",
+    "platelshik": "💲 Плательщик",
+    "forma_oplaty": "💲 Нал-Б/Н",
+}
+
+
 def tariff_edit_menu_keyboard(order_key: str) -> InlineKeyboardMarkup:
-    keys = list(FIELD_DEFS.keys())
-    rows = []
-    for i in range(0, len(keys), 2):
-        row_keys = keys[i:i + 2]
-        rows.append([
-            InlineKeyboardButton(f"✏️ {FIELD_DEFS[k]['label']}", callback_data=f"editfield|{k}|{order_key}")
+    rows = [
+        [
+            InlineKeyboardButton(_EDIT_MENU_LABELS[k], callback_data=f"editfield|{k}|{order_key}")
             for k in row_keys
-        ])
+        ]
+        for row_keys in _EDIT_MENU_ROWS
+    ]
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data=f"editback|{order_key}")])
     return InlineKeyboardMarkup(rows)
 
