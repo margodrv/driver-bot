@@ -567,7 +567,7 @@ def build_tariff_preview(tariff: dict, author_line: str = "", edited_fields: set
     else:
         lines.append("⚠️ Форма оплаты: не указана")
 
-    lines.extend(_format_tariff_json_lines(tariff.get("tariff_json") or {}))
+    lines.extend(_format_tariff_json_lines(tariff.get("tariff_json") or {}, edited_fields))
 
     for item in tariff.get("neponyatno") or []:
         lines.append(f"⚠️ не понял: {item}")
@@ -575,15 +575,16 @@ def build_tariff_preview(tariff: dict, author_line: str = "", edited_fields: set
     return "\n".join(lines)
 
 
-def _format_tariff_json_lines(tj: dict) -> list:
+def _format_tariff_json_lines(tj: dict, edited_fields: set = frozenset()) -> list:
     """Раньше эти поля писались в Тариф_JSON, но нигде не показывались в
     превью - логист не видел, например, что доп.точка распознана. Теперь
     показываем компактной строкой всё, что реально заполнено."""
     lines = []
+    star = lambda keys: " ⭐️" if edited_fields & set(keys) else ""
 
     gb = tj.get("gidrobort")
     if gb:
-        lines.append(f"Гідроборт: {_fmt_num(gb.get('summa'))} (по факту)")
+        lines.append(f"Гідроборт: {_fmt_num(gb.get('summa'))} (по факту){star(['gidrobort'])}")
 
     dh = tj.get("dop_hodka")
     if dh:
@@ -597,26 +598,26 @@ def _format_tariff_json_lines(tj: dict) -> list:
     dt = tj.get("dop_tochka")
     if dt:
         if dt.get("tip") == "pereschet_minimalki":
-            lines.append(f"Доп.точка: новый минимум {_fmt_num(dt.get('summa'))} грн")
+            lines.append(f"Доп.точка: новый минимум {_fmt_num(dt.get('summa'))} грн{star(['dop_tochka'])}")
         else:
-            lines.append(f"Доп.точка: +{_fmt_num(dt.get('summa'))} грн")
+            lines.append(f"Доп.точка: +{_fmt_num(dt.get('summa'))} грн{star(['dop_tochka'])}")
 
     if tj.get("km_stavka") is not None:
-        lines.append(f"Км: {_fmt_num(tj['km_stavka'])} грн/км")
+        lines.append(f"Км: {_fmt_num(tj['km_stavka'])} грн/км{star(['km'])}")
 
     ves = tj.get("ves")
     if ves:
         if ves.get("tip") == "porogovaya" and ves.get("porogi"):
             parts = [f"від {_fmt_num(p.get('ot'))}кг по {_fmt_num(p.get('stavka'))}грн" for p in ves["porogi"]]
-            lines.append("Вес: " + ", ".join(parts))
+            lines.append("Вес: " + ", ".join(parts) + star(["ves"]))
         elif ves.get("stavka") is not None:
-            lines.append(f"Вес: {_fmt_num(ves.get('stavka'))} грн/кг")
+            lines.append(f"Вес: {_fmt_num(ves.get('stavka'))} грн/кг{star(['ves'])}")
 
     if tj.get("etazhi_stavka") is not None:
-        lines.append(f"Этажи: {_fmt_num(tj['etazhi_stavka'])} грн")
+        lines.append(f"Этажи: {_fmt_num(tj['etazhi_stavka'])} грн{star(['etazhi'])}")
 
     if tj.get("prohody_stavka") is not None:
-        lines.append(f"Проходы: {_fmt_num(tj['prohody_stavka'])} грн")
+        lines.append(f"Проходы: {_fmt_num(tj['prohody_stavka'])} грн{star(['prohody'])}")
 
     for dop in tj.get("prochie_dopy") or []:
         summa = dop.get("summa")
@@ -798,9 +799,10 @@ def _apply_kom_gruzchiki(tariff, text):
 
 def _apply_platelshik(tariff, text):
     tariff["platelshik"] = _parse_platelshik(text)
-    # Подтверждённое правило: платежи от диспетчера всегда безналичные.
-    if tariff["platelshik"] == "Диспетчер" and not tariff.get("forma_oplaty"):
-        tariff["forma_oplaty"] = "БН"
+    # Подтверждённое правило: диспетчер платит безналом, во всех
+    # остальных случаях по умолчанию - нал (см. apply_defaults).
+    if not tariff.get("forma_oplaty"):
+        tariff["forma_oplaty"] = "БН" if tariff["platelshik"] == "Диспетчер" else "Нал"
 
 
 def _apply_forma_oplaty(tariff, text):
@@ -971,21 +973,21 @@ _EDIT_MENU_ROWS = [
 ]
 
 _EDIT_MENU_LABELS = {
-    "avto_baza": "🚖 Авто",
-    "avto_dop_chas": "🚖 Доп час",
-    "min_chasov": "🚖 Мин. часов",
-    "km": "🚖 Км",
-    "dop_tochka": "🚖 Точка",
-    "gidrobort": "🚖 ГБ",
-    "kom_avto": "🚖 Ком авто",
-    "kom_gruzchiki": "🏋️\u200d♀️ Ком Грузчики",
+    "avto_baza": "🚘 Авто",
+    "avto_dop_chas": "🚘 Доп час",
+    "min_chasov": "🚘 Мин. часов",
+    "km": "🚘 Км",
+    "dop_tochka": "🚘 Точка",
+    "gidrobort": "🚘 ГБ",
+    "kom_avto": "🚘 Ком авто",
+    "kom_gruzchiki": "🏋️\u200d♀️ Ком грузчики",
     "gruzchiki_baza": "🏋️\u200d♀️ Грузчики",
     "gruzchiki_dop_chas": "🏋️\u200d♀️ Доп час",
     "etazhi": "🏋️\u200d♀️ Этаж",
     "prohody": "🏋️\u200d♀️ Проход",
     "ves": "🏋️\u200d♀️ Вес",
-    "platelshik": "💲 Плательщик",
-    "forma_oplaty": "💲 Нал-Б/Н",
+    "platelshik": "🧮 Плательщик",
+    "forma_oplaty": "🧮 Нал-Б/Н",
 }
 
 
@@ -1011,9 +1013,12 @@ def apply_defaults(sheet, row, tariff: dict) -> dict:
 
     1) Мин.часов по типу авто (см. default_min_hours_for_vehicle) - если
        GPT не нашёл явных мин.часов в тексте и это не фикс.
-    2) Форма оплаты = БН, если плательщик - Диспетчер и форма оплаты не
-       указана явно. Подтверждено: у GoroD платежи от диспетчера всегда
-       безналичные, это не нужно каждый раз писать в заявке.
+    2) Форма оплаты: если плательщик - Диспетчер и форма не указана явно
+       -> БН (платежи от диспетчера у GoroD всегда безналичные). Во ВСЕХ
+       остальных случаях, когда форма не указана явно (включая случаи,
+       когда плательщик - Клиент или не определён) -> Нал по умолчанию.
+       Итог: предупреждение "форма оплаты не указана" теперь не должно
+       появляться вообще - у бота всегда есть разумное умолчание.
     """
     if tariff.get("tip_rascheta") != "фикс" and tariff.get("min_chasov") is None:
         vt_col = ensure_vehicle_type_column(sheet)
@@ -1022,8 +1027,8 @@ def apply_defaults(sheet, row, tariff: dict) -> dict:
         if default_hours is not None:
             tariff["min_chasov"] = default_hours
 
-    if tariff.get("platelshik") == "Диспетчер" and not tariff.get("forma_oplaty"):
-        tariff["forma_oplaty"] = "БН"
+    if not tariff.get("forma_oplaty"):
+        tariff["forma_oplaty"] = "БН" if tariff.get("platelshik") == "Диспетчер" else "Нал"
 
     return tariff
 
