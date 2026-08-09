@@ -15,7 +15,9 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
+    MessageHandler,
     ContextTypes,
+    filters,
 )
 
 logging.basicConfig(
@@ -34,6 +36,7 @@ GOOGLE_SHEET_ID = os.environ["GOOGLE_SHEET_ID"]
 GOOGLE_CREDENTIALS_JSON = os.environ["GOOGLE_CREDENTIALS_JSON"]
 SHEET_TAB_NAME = os.environ.get("SHEET_TAB_NAME", "Orders clean")
 LOG_SHEET_TAB_NAME = os.environ.get("LOG_SHEET_TAB_NAME", "Log")
+TARIFF_CORRECTIONS_TAB_NAME = os.environ.get("TARIFF_CORRECTIONS_TAB_NAME", "Tariff_corrections")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 WEBHOOK_PORT = int(os.environ.get("PORT", "8080"))
 
@@ -152,6 +155,36 @@ def log_event(text: str, chat_id="", message_id="", row=""):
         )
     except Exception as e:
         logger.error(f"Не удалось записать в Log: {e}")
+
+
+def get_tariff_corrections_sheet():
+    spreadsheet = _client().open_by_key(GOOGLE_SHEET_ID)
+    try:
+        return spreadsheet.worksheet(TARIFF_CORRECTIONS_TAB_NAME)
+    except gspread.exceptions.WorksheetNotFound:
+        sheet = spreadsheet.add_worksheet(title=TARIFF_CORRECTIONS_TAB_NAME, rows=2000, cols=5)
+        sheet.append_row(["Время", "Order_key", "Текст заявки", "Разбор GPT (JSON)", "Правка логиста (текст)"])
+        return sheet
+
+
+def log_tariff_correction(order_key: str, order_text: str, gpt_tariff: dict, correction_text: str):
+    """Сохраняет пару 'как разобрал GPT -> как исправил логист' - сырьё для
+    будущих few-shot примеров в промпте (см. обсуждение обучения). Сам
+    бот эту правку пока НЕ применяет к столбцам тарифа - это отдельная
+    задача (флоу 'применить правку' строится позже).
+    """
+    try:
+        get_tariff_corrections_sheet().append_row(
+            [
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                order_key,
+                order_text,
+                json.dumps(gpt_tariff, ensure_ascii=False),
+                correction_text,
+            ]
+        )
+    except Exception as e:
+        logger.error(f"Не удалось записать исправление тарифа в {TARIFF_CORRECTIONS_TAB_NAME}: {e}")
 
 
 def find_row_by_key(sheet, key: str):
@@ -394,7 +427,13 @@ def write_tariff_to_sheet(sheet, row_num: int, tariff: dict):
 # просто пересчитает тариф заново из текста заявки (см. ниже), а не
 # заставляет логиста присылать всё вручную.
 # ---------------------------------------------------------------------------
+# order_key -> распарсенный тариф, ждущий подтверждения (см. комментарий выше)
 _pending_tariffs: dict[str, dict] = {}
+
+# (chat_id, message_id превью-сообщения бота) -> order_key. Заполняется при
+# нажатии "✏️ Исправить", чтобы понять, к какому заказу относится текстовый
+# reply логиста, когда он придёт следующим сообщением.
+_awaiting_correction: dict[tuple[int, int], str] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -451,12 +490,50 @@ async def handle_tariff_callback(update: Update, context: ContextTypes.DEFAULT_T
         await query.edit_message_text(query.message.text + "\n\n✅ Подтверждено")
 
     elif action == "tariff_fix":
-        # Флоу правки тарифа - отдельная задача, обсуждаем структуру
-        # отдельно (текстом одним сообщением или по полям). Пока просто
-        # просим прислать тариф текстом реплаем на это же сообщение.
+        # Полноценный флоу применения правки (по полям и т.п.) - отдельная
+        # задача на будущее. Пока просим прислать верный тариф текстом,
+        # реплаем на это же сообщение, и просто ЛОГИРУЕМ пару "как
+        # разобрал GPT -> как исправил логист" - сырьё для будущих
+        # few-shot примеров в промпте (см. handle_tariff_correction_reply).
+        _awaiting_correction[(query.message.chat_id, query.message.message_id)] = order_key
         await query.edit_message_text(
             query.message.text + "\n\n✏️ Пришлите верный тариф текстом, ответом на это сообщение."
         )
+
+
+async def handle_tariff_correction_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ловит текстовый reply логиста на сообщение 'пришлите верный тариф' и
+    логирует пару (текст заявки, разбор GPT, правка логиста) в
+    Tariff_corrections. Правка пока НЕ применяется автоматически к
+    столбцам тарифа - это отдельная будущая задача.
+    """
+    msg = update.message
+    replied = msg.reply_to_message
+    if not replied:
+        return
+
+    key = (msg.chat_id, replied.message_id)
+    order_key = _awaiting_correction.get(key)
+    if not order_key:
+        return  # обычный reply, к правке тарифа отношения не имеет
+
+    pending = _pending_tariffs.get(order_key, {})
+    sheet = get_sheet()
+    row_num = find_row_by_key(sheet, order_key)
+    order_text = ""
+    if row_num:
+        row = sheet.row_values(row_num)
+        order_text = row[COL_J_TEXT - 1] if len(row) >= COL_J_TEXT else ""
+
+    log_tariff_correction(order_key, order_text, pending, msg.text or "")
+    _awaiting_correction.pop(key, None)
+
+    await msg.reply_text(
+        "Записано, спасибо. Пока сама правка в таблицу не применяется "
+        "автоматически - при необходимости внесите верный тариф в "
+        "соответствующие столбцы вручную."
+    )
+    log_event("Правка тарифа записана в Tariff_corrections", row=row_num)
 
 
 # ---------------------------------------------------------------------------
@@ -532,6 +609,12 @@ async def process_new_order(tg_app: Application, order_key: str):
 async def main():
     tg_app = Application.builder().token(BOT_TOKEN).build()
     tg_app.add_handler(CallbackQueryHandler(handle_tariff_callback))
+    tg_app.add_handler(
+        MessageHandler(
+            filters.UpdateType.MESSAGE & filters.TEXT & filters.REPLY,
+            handle_tariff_correction_reply,
+        )
+    )
 
     aio_app = web.Application()
     aio_app["tg_app"] = tg_app
