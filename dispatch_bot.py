@@ -435,10 +435,15 @@ _TARIFF_SYSTEM_PROMPT = """\
   Пример: "Тар 6000/1200/600" без слов рядом с "600" -> avto_baza=6000,
   avto_dop_chas=1200, neponyatno=["600: ГБ?/точка?/км?"] (без "этаж?"/
   "проход?" - 600 слишком много для них).
-- Гидроборт (gidrobort) заполняй ТОЛЬКО если в тексте явно написано что-то
-  вида "гідроборт +950 якщо використовують" - то есть оплата по факту
-  использования, а не автоматическая доплата. Если гидроборт просто
-  упомянут как характеристика авто без суммы "по факту" - не заполняй.
+- Гидроборт (gidrobort) заполняй ТОЛЬКО если в тексте явно написано число
+  рядом со словом "гідроборт", означающее доплату (например "гідроборт
+  +950 якщо використовують"). ПОДТВЕРЖДЕНО: если "гідроборт" упомянут
+  просто как характеристика авто в описании машины (например "5т
+  гідроборт + 2 вантажника") - БЕЗ суммы рядом - считается, что
+  гідроборт УЖЕ включён в тариф авто, отдельно за него НЕ доплачивают.
+  В этом случае gidrobort = null, НИКОГДА не ставь summa=0 или пустую
+  структуру "для галочки". Если логист позже решит, что доплата всё же
+  нужна - он внесёт её вручную через отдельную кнопку.
 - Любая сумма вида "від X" (например "збір меблів від 500грн") - это
   сумма, известная точно только по факту на месте (её может знать
   водитель, но не логист заранее) - НЕ помечай её в neponyatno (это не
@@ -459,6 +464,12 @@ _TARIFF_SYSTEM_PROMPT = """\
 
 Вход: "Тариф 2500\nКом 10%"
 Выход (фрагмент): "avto_baza": 2500, "avto_dop_chas": null, "tip_rascheta": "фикс", "kom_avto": {"znachenie": 10, "tip": "%"}
+
+Вход: "Тариф:\nАвто 5000/1200\nВантажники 1600/800\nКом\nАвто 1000/400\nВант 400/200/10"
+Выход (фрагмент): "kom_avto": {"tip": "pochasovka", "baza": 1000, "dop_chas": 400}, "kom_gruzchiki": {"tip": "pochasovka", "baza": 400, "dop_chas": 200, "dopy": [10]}
+(ВАЖНО: третье число "10" у комиссии грузчиков НЕ теряется - идёт в dopy,
+даже если непонятно, за что именно оно - как и с gruzchiki_dopy, не
+классифицируем, просто сохраняем.)
 """
 
 
@@ -540,6 +551,78 @@ def find_pending_neponyatno_value(tariff: dict, field_key: str):
     return None
 
 
+def _strip_bogus_gidrobort(result: dict):
+    """Упоминание 'гідроборт' как характеристики авто (например '5т
+    гідроборт + 2 вантажника') НЕ означает отдельную доплату - по
+    умолчанию считаем, что она уже в тарифе. Платная доплата бывает
+    ТОЛЬКО с явной суммой 'по факту використання'. GPT иногда всё равно
+    создаёт запись с summa=0/пусто просто от упоминания слова - это
+    ловим и убираем кодом, а не полагаемся только на текст промпта.
+    Если логист вручную решит, что доплата всё же нужна - внесёт через
+    кнопку 'ГБ' в меню правки, как обычно.
+    """
+    tj = result.get("tariff_json") or {}
+    gb = tj.get("gidrobort")
+    if gb and not gb.get("summa"):
+        tj["gidrobort"] = None
+
+
+_LOADER_STRAY_KEYWORDS = ("ваг", "доп", "вес", "этаж", "поверх", "прохід", "проход")
+
+
+def _reconcile_neponyatno(result: dict):
+    """Две вещи, которые код гарантирует сам, а не полагается на то, что
+    GPT в этот раз правильно следовал тексту промпта:
+
+    1) Если число уже успешно классифицировано в другое поле (доп.точка/
+       км/этажи/проходы/гідроборт) - оно не должно ТАКЖЕ висеть в
+       neponyatno как будто не разобрано. Убираем дубль.
+    2) Если в заказе есть грузчики, а среди 'не понял' есть числа с
+       явно 'грузчицкими' кандидатами (вага/доп/этаж/проход) - это
+       почти наверняка лишние числа из строки 'Вантажники ...', которые
+       по правилу должны были просто уйти в gruzchiki_dopy без
+       классификации, но GPT иногда всё равно пытается их классифицировать.
+       Переносим такие числа в gruzchiki_dopy и убираем предупреждение -
+       не теряем число молча и не пугаем логиста лишним вопросом.
+    """
+    tj = result.get("tariff_json") or {}
+    used_numbers = set()
+    for key in ("dop_tochka", "gidrobort"):
+        d = tj.get(key)
+        if d and d.get("summa") is not None:
+            used_numbers.add(_fmt_num(d["summa"]))
+    for key in ("km_stavka", "etazhi_stavka", "prohody_stavka"):
+        v = tj.get(key)
+        if v is not None:
+            used_numbers.add(_fmt_num(v))
+
+    has_gruzchiki = result.get("gruzchiki_baza") is not None
+    gruzchiki_dopy = list(result.get("gruzchiki_dopy") or [])
+
+    kept = []
+    for item in result.get("neponyatno") or []:
+        m = _NEPONYATNO_ITEM_RE.match(item)
+        if not m:
+            kept.append(item)
+            continue
+        num_str, cands_str = m.groups()
+        if num_str in used_numbers:
+            continue  # уже классифицировано в другом поле - дубль убираем
+
+        if has_gruzchiki and any(k in cands_str.lower() for k in _LOADER_STRAY_KEYWORDS):
+            try:
+                gruzchiki_dopy.append(float(num_str.replace(",", ".")))
+                continue  # ушло в gruzchiki_dopy, предупреждение не нужно
+            except ValueError:
+                pass
+
+        kept.append(item)
+
+    result["neponyatno"] = kept
+    if gruzchiki_dopy:
+        result["gruzchiki_dopy"] = gruzchiki_dopy
+
+
 def parse_tariff_via_gpt(order_text: str) -> dict:
     """Возвращает распарсенный тариф как dict (см. _TARIFF_SYSTEM_PROMPT).
     При любой ошибке (нет клиента, невалидный JSON, таймаут) возвращает
@@ -569,6 +652,8 @@ def parse_tariff_via_gpt(order_text: str) -> dict:
         raw = re.sub(r"^```json\s*|\s*```$", "", raw.strip())
         result = json.loads(raw)
         result["neponyatno"] = _filter_neponyatno(result)
+        _strip_bogus_gidrobort(result)
+        _reconcile_neponyatno(result)
         return result
     except Exception as e:
         logger.error(f"Ошибка разбора тарифа через GPT: {e}")
@@ -664,7 +749,7 @@ def _format_tariff_json_lines(tj: dict, edited_fields: set = frozenset()) -> lis
     star = lambda keys: " ⭐️" if edited_fields & set(keys) else ""
 
     gb = tj.get("gidrobort")
-    if gb:
+    if gb and gb.get("summa"):
         lines.append(f"Гідроборт: {_fmt_num(gb.get('summa'))} (по факту){star(['gidrobort'])}")
 
     dh = tj.get("dop_hodka")
@@ -905,8 +990,16 @@ def _resolve_neponyatno(tariff):
 
 
 def _apply_gidrobort(tariff, text):
+    t = text.strip().lower()
     tj = tariff.setdefault("tariff_json", {})
-    tj["gidrobort"] = {"summa": _parse_one_number(text), "po_faktu": True}
+    if t in _EMPTY_VALUES:
+        tj["gidrobort"] = None
+        _resolve_neponyatno(tariff)
+        return
+    v = _parse_one_number(text)
+    if v == 0:
+        raise ValueError("0 не похоже на доплату 'по факту' - если доплаты нет, оставьте пустым ('-')")
+    tj["gidrobort"] = {"summa": v, "po_faktu": True}
     _resolve_neponyatno(tariff)
 
 
