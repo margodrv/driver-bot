@@ -335,6 +335,15 @@ _TARIFF_SYSTEM_PROMPT = """\
 в строго структурированном JSON. Отвечай ТОЛЬКО валидным JSON, без
 пояснений, без markdown-разметки, без ```json.
 
+ВАЖНО про границы задачи: тебя интересует ТОЛЬКО тариф (цены, ставки,
+комиссии, условия оплаты). Точки маршрута (Т1, Т2, Т3...), адреса,
+названия груза, контакты, ФИО, номера телефонов, статус "Т2 ?" (адрес
+ещё не определён) и всё, что не является частью тарифа - НЕ твоя зона
+ответственности, НЕ упоминай это в "neponyatno" ни в каком виде, даже
+если что-то там выглядит незаполненным или странным. "neponyatno"
+предназначено ИСКЛЮЧИТЕЛЬНО для чисел/условий внутри самого тарифа,
+которые ты не смог классифицировать.
+
 Формат ответа:
 {
   "avto_baza": число или null,
@@ -342,9 +351,10 @@ _TARIFF_SYSTEM_PROMPT = """\
   "avto_dop_chas": число или null,
   "gruzchiki_baza": число или null,
   "gruzchiki_dop_chas": число или null,
+  "gruzchiki_dopy": [число, ...] или [],
   "tip_rascheta": "почасовка" | "фикс",
-  "kom_avto": {"znachenie": число, "tip": "%" | "сумма"} или null,
-  "kom_gruzchiki": {"znachenie": число, "tip": "%" | "сумма"} или null,
+  "kom_avto": {"znachenie": число, "tip": "%" | "сумма"} или {"tip": "pochasovka", "baza": число, "dop_chas": число, "dopy": [число,...]} или null,
+  "kom_gruzchiki": {"znachenie": число, "tip": "%" | "сумма"} или {"tip": "pochasovka", "baza": число, "dop_chas": число, "dopy": [число,...]} или null,
   "platelshik": "Клиент" | "Диспетчер" или null,
   "forma_oplaty": "Нал" | "БН" или null,
   "tariff_json": {
@@ -356,7 +366,9 @@ _TARIFF_SYSTEM_PROMPT = """\
     "prohody_stavka": число или null,
     "prochie_dopy": [{"nazvanie": строка, "summa": число}] или []
   },
-  "neponyatno": [строка с кратким описанием, что именно не удалось разобрать]
+  "neponyatno": [КОРОТКАЯ строка вида "<число>: вариант1?/вариант2?"
+    - только про цифры/условия оплаты в САМОМ ТАРИФЕ, никогда про
+    адреса/маршрут/груз. Без полных предложений.]
 }
 
 Правила:
@@ -374,6 +386,12 @@ _TARIFF_SYSTEM_PROMPT = """\
      грузчиков (сколько им платят за работу) - обычно указан как два
      числа через "/" рядом со словом "вантажники"/"грузчики" (например
      "Вантажники: 2400/1200" -> gruzchiki_baza=2400, gruzchiki_dop_chas=1200).
+     ЕСЛИ в этой же строке БОЛЬШЕ двух чисел через "/" (например
+     "Вантажники 1600/800/4/20") - первые два, как обычно, gruzchiki_baza/
+     gruzchiki_dop_chas, а ВСЕ остальные числа (по порядку появления)
+     клади в gruzchiki_dopy как массив чисел. НЕ пытайся понять их смысл
+     (вес/этаж/проход/что-то ещё) - это не нужно, просто сохрани числа по
+     порядку как есть.
   2) "kom_gruzchiki" - это КОМИССИЯ компании С работы грузчиков (процент
      или фиксированная сумма, которую забирает компания/диспетчер) -
      заполняй ТОЛЬКО если рядом явно есть слово "ком"/"коміс"/"комісія"
@@ -382,6 +400,13 @@ _TARIFF_SYSTEM_PROMPT = """\
      по формату на "Авто_база/Авто_доп_час". Никогда не подставляй тариф
      грузчиков в kom_gruzchiki просто потому что больше некуда - для
      этого есть отдельные поля выше.
+- Комиссия (kom_avto/kom_gruzchiki) МОЖЕТ сама быть ступенчатой (не
+  только % или разовая сумма) - если явно видно два числа рядом со
+  словом "ком" в формате "база/доп.час" (например "Ком авто 1000/400
+  наступний/слідуючий час" -> {"tip": "pochasovka", "baza": 1000,
+  "dop_chas": 400}). Если чисел больше двух - остальные (по порядку) в
+  "dopy", аналогично правилу для gruzchiki_dopy выше, без попытки понять
+  их смысл. Обычная % или разовая сумма (одно число) остаются как раньше.
 - tip_rascheta определяется КОЛИЧЕСТВОМ чисел в тарифе - строгое правило:
   - Тариф - ДВА (или больше) числа через "/" (например "4100/900",
     "5300/900/20") -> tip_rascheta="почасовка", ПЕРВОЕ число это
@@ -397,8 +422,12 @@ _TARIFF_SYSTEM_PROMPT = """\
   ключевому слову рядом с ним: "км"/"кілометр" -> не входит в текущую
   структуру, помечай в neponyatno; "этаж"/"поверх" -> etazhi_stavka;
   "прохід"/"проход"/"заносов" -> prohody_stavka; "точка"/"Т3" -> dop_tochka.
-  Если рядом с числом нет ни одного из этих триггер-слов - НЕ угадывай его
-  назначение, оставь соответствующее поле null и опиши число в neponyatno.
+  Если рядом с числом нет ни одного из этих триггер-слов - это ОБЯЗАТЕЛЬНО
+  должно попасть в neponyatno, никогда не теряй число молча. Формат КОРОТКИЙ
+  - число и кандидаты через "/", БЕЗ полных предложений: "<число>:
+  ГБ?/точка?/км?/этаж?/проход?". Пример: "Тар 6000/1200/600" без слов рядом
+  с "600" -> avto_baza=6000, avto_dop_chas=1200, neponyatno=["600:
+  ГБ?/точка?/км?/этаж?/проход?"].
 - Гидроборт (gidrobort) заполняй ТОЛЬКО если в тексте явно написано что-то
   вида "гідроборт +950 якщо використовують" - то есть оплата по факту
   использования, а не автоматическая доплата. Если гидроборт просто
@@ -435,7 +464,7 @@ def parse_tariff_via_gpt(order_text: str) -> dict:
     """
     fallback = {
         "avto_baza": None, "min_chasov": None, "avto_dop_chas": None,
-        "gruzchiki_baza": None, "gruzchiki_dop_chas": None,
+        "gruzchiki_baza": None, "gruzchiki_dop_chas": None, "gruzchiki_dopy": [],
         "tip_rascheta": "почасовка", "kom_avto": None, "kom_gruzchiki": None,
         "platelshik": None, "forma_oplaty": None,
         "tariff_json": {}, "neponyatno": ["не удалось разобрать тариф (GPT недоступен)"],
@@ -493,7 +522,14 @@ def build_tariff_preview(tariff: dict, author_line: str = "", edited_fields: set
         gr_dop = _fmt_num(tariff.get("gruzchiki_dop_chas"))
         # Грузчики всегда на 2ч по подтверждённому бизнес-правилу - это
         # константа, не значение из текста заявки или GPT.
-        lines.append(f"Грузчики: {_fmt_num(gr_base)} (2ч)/{gr_dop}{star(['gruzchiki_baza', 'gruzchiki_dop_chas'])}")
+        gr_line = f"Грузчики: {_fmt_num(gr_base)} (2ч)/{gr_dop}"
+        gr_extra = tariff.get("gruzchiki_dopy") or []
+        if gr_extra:
+            # Доп.числа (вес/этаж/проход и т.п.) НЕ классифицируем - просто
+            # дописываем по порядку как в тексте заявки, логист сам знает,
+            # что есть что, глядя на исходную заявку рядом.
+            gr_line += "/" + "/".join(_fmt_num(n) for n in gr_extra)
+        lines.append(gr_line + star(["gruzchiki_baza", "gruzchiki_dop_chas", "gruzchiki_dopy"]))
 
     kom_avto = tariff.get("kom_avto")
     kom_gruz = tariff.get("kom_gruzchiki")
@@ -501,8 +537,8 @@ def build_tariff_preview(tariff: dict, author_line: str = "", edited_fields: set
     def kom_str(k):
         if not k:
             return None
-        v = _fmt_num(k.get("znachenie"))
-        return f"{v}%" if k.get("tip") == "%" else f"{v} грн"
+        raw = _kom_cell(k)
+        return raw if k.get("tip") == "%" else f"{raw} грн"
 
     a_str, g_str = kom_str(kom_avto), kom_str(kom_gruz)
     kom_star = star(["kom_avto", "kom_gruzchiki"])
@@ -584,8 +620,23 @@ def _format_tariff_json_lines(tj: dict) -> list:
 # Запись тарифа в Sheets - целиком или отдельными полями
 # ---------------------------------------------------------------------------
 def _kom_cell(k):
+    """Компактная строка для записи в ячейку Ком_авто/Ком_грузчики.
+    Поддерживает три формата комиссии:
+    - {"tip": "%", "znachenie": N} -> "10%"
+    - {"tip": "сумма", "znachenie": N} -> "500"
+    - {"tip": "pochasovka", "baza": N, "dop_chas": N, "dopy": [...]} -> "1000/400/10"
+      (ступенчатая комиссия - сама имеет базу+доп.час, как обычный тариф;
+      структура при этом полностью сохраняется в Тариф_JSON для будущего
+      калькулятора, здесь только читаемая строка для глаз)
+    """
     if not k:
         return ""
+    if k.get("tip") == "pochasovka":
+        parts = [_fmt_num(k.get("baza"))]
+        if k.get("dop_chas") is not None:
+            parts.append(_fmt_num(k.get("dop_chas")))
+        parts += [_fmt_num(n) for n in (k.get("dopy") or [])]
+        return "/".join(parts)
     v = _fmt_num(k.get("znachenie"))
     return f"{v}%" if k.get("tip") == "%" else f"{v}"
 
@@ -594,6 +645,11 @@ def build_tariff_row_values(tariff: dict) -> dict:
     """{имя_колонки: значение_для_записи} для всех тарифных колонок -
     общий источник и для полной записи (при ✅), и для точечной записи
     одного поля (при правке через карандаш)."""
+    tj = dict(tariff.get("tariff_json") or {})
+    gr_dopy = tariff.get("gruzchiki_dopy") or []
+    if gr_dopy:
+        tj["gruzchiki_dopy"] = gr_dopy
+
     return {
         "Авто_база": _fmt_num(tariff.get("avto_baza")),
         "Мин_часов": _fmt_num(tariff.get("min_chasov")),
@@ -605,7 +661,7 @@ def build_tariff_row_values(tariff: dict) -> dict:
         "Плательщик": tariff.get("platelshik") or "",
         "Тип_расчёта": tariff.get("tip_rascheta") or "",
         "Форма_оплаты": tariff.get("forma_oplaty") or "",
-        "Тариф_JSON": json.dumps(tariff.get("tariff_json") or {}, ensure_ascii=False),
+        "Тариф_JSON": json.dumps(tj, ensure_ascii=False),
     }
 
 
@@ -646,16 +702,27 @@ def _parse_one_number(text: str):
 def _parse_kom(text: str):
     t = text.strip()
     if not t:
-        raise ValueError("нужно число, например 10% или 500")
+        raise ValueError("нужно число, например 10% или 500 или 1000/400")
     if t.endswith("%"):
         try:
             return {"znachenie": float(t[:-1].strip().replace(",", ".")), "tip": "%"}
         except ValueError:
             raise ValueError("нужно число перед %, например 10%")
+    if "/" in t:
+        try:
+            nums = [float(p.strip().replace(",", ".")) for p in t.split("/")]
+        except ValueError:
+            raise ValueError("нужны числа через /, например 1000/400")
+        result = {"tip": "pochasovka", "baza": nums[0]}
+        if len(nums) >= 2:
+            result["dop_chas"] = nums[1]
+        if len(nums) > 2:
+            result["dopy"] = nums[2:]
+        return result
     try:
         return {"znachenie": float(t.replace(",", ".")), "tip": "сумма"}
     except ValueError:
-        raise ValueError("нужно число, например 10% или 500")
+        raise ValueError("нужно число, например 10% или 500 или 1000/400")
 
 
 def _parse_platelshik(text: str):
@@ -730,6 +797,38 @@ def _apply_forma_oplaty(tariff, text):
     tariff["forma_oplaty"] = _parse_forma_oplaty(text)
 
 
+def _resolve_neponyatno(tariff):
+    """При правке любого из 'кандидатных' полей (ГБ/точка/этаж/проход)
+    считаем неоднозначность разрешённой и снимаем предупреждения - иначе
+    строка '⚠️ не понял: 600 ГБ?/точка?...' зависла бы в превью даже
+    после того, как логист явно указал, чем число является."""
+    tariff["neponyatno"] = []
+
+
+def _apply_gidrobort(tariff, text):
+    tj = tariff.setdefault("tariff_json", {})
+    tj["gidrobort"] = {"summa": _parse_one_number(text), "po_faktu": True}
+    _resolve_neponyatno(tariff)
+
+
+def _apply_dop_tochka(tariff, text):
+    tj = tariff.setdefault("tariff_json", {})
+    tj["dop_tochka"] = {"tip": "doplata_fix", "summa": _parse_one_number(text)}
+    _resolve_neponyatno(tariff)
+
+
+def _apply_etazhi(tariff, text):
+    tj = tariff.setdefault("tariff_json", {})
+    tj["etazhi_stavka"] = _parse_one_number(text)
+    _resolve_neponyatno(tariff)
+
+
+def _apply_prohody(tariff, text):
+    tj = tariff.setdefault("tariff_json", {})
+    tj["prohody_stavka"] = _parse_one_number(text)
+    _resolve_neponyatno(tariff)
+
+
 # field_key -> {label, hint, apply(tariff, text), columns затрагиваемые в Sheets}
 # Каждое поле правится НЕЗАВИСИМО одним числом - никаких "два числа через
 # /" в одном вводе, чтобы нельзя было случайно стереть соседнее значение,
@@ -756,11 +855,11 @@ FIELD_DEFS = {
         "apply": _apply_gruzchiki_dop_chas, "columns": ["Грузчики_доп_час"],
     },
     "kom_avto": {
-        "label": "Ком. авто", "hint": "например: 10% или 500",
+        "label": "Ком. авто", "hint": "10% или 500, или 1000/400 - ступенчато по часам",
         "apply": _apply_kom_avto, "columns": ["Ком_авто"],
     },
     "kom_gruzchiki": {
-        "label": "Ком. грузчики", "hint": "например: 10% или 500",
+        "label": "Ком. грузчики", "hint": "10% или 500, или 400/200/10 - ступенчато по часам",
         "apply": _apply_kom_gruzchiki, "columns": ["Ком_грузчики"],
     },
     "platelshik": {
@@ -770,6 +869,22 @@ FIELD_DEFS = {
     "forma_oplaty": {
         "label": "Форма оплаты", "hint": "Нал или БН",
         "apply": _apply_forma_oplaty, "columns": ["Форма_оплаты"],
+    },
+    "gidrobort": {
+        "label": "Гідроборт", "hint": "например: 950 (по факту использования)",
+        "apply": _apply_gidrobort, "columns": ["Тариф_JSON"],
+    },
+    "dop_tochka": {
+        "label": "Доп.точка", "hint": "например: 500",
+        "apply": _apply_dop_tochka, "columns": ["Тариф_JSON"],
+    },
+    "etazhi": {
+        "label": "Этажи", "hint": "например: 200 (грн)",
+        "apply": _apply_etazhi, "columns": ["Тариф_JSON"],
+    },
+    "prohody": {
+        "label": "Проходы", "hint": "например: 150 (грн)",
+        "apply": _apply_prohody, "columns": ["Тариф_JSON"],
     },
 }
 
