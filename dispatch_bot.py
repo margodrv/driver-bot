@@ -519,13 +519,65 @@ def build_tariff_preview(tariff: dict, author_line: str = "", edited_fields: set
     if tariff.get("platelshik"):
         lines.append(f"Плательщик: {tariff['platelshik']}{star(['platelshik'])}")
 
-    if not tariff.get("forma_oplaty"):
+    if tariff.get("forma_oplaty"):
+        lines.append(f"Форма оплаты: {tariff['forma_oplaty']}{star(['forma_oplaty', 'platelshik'])}")
+    else:
         lines.append("⚠️ Форма оплаты: не указана")
+
+    lines.extend(_format_tariff_json_lines(tariff.get("tariff_json") or {}))
 
     for item in tariff.get("neponyatno") or []:
         lines.append(f"⚠️ не понял: {item}")
 
     return "\n".join(lines)
+
+
+def _format_tariff_json_lines(tj: dict) -> list:
+    """Раньше эти поля писались в Тариф_JSON, но нигде не показывались в
+    превью - логист не видел, например, что доп.точка распознана. Теперь
+    показываем компактной строкой всё, что реально заполнено."""
+    lines = []
+
+    gb = tj.get("gidrobort")
+    if gb:
+        lines.append(f"Гідроборт: {_fmt_num(gb.get('summa'))} (по факту)")
+
+    dh = tj.get("dop_hodka")
+    if dh:
+        if dh.get("tip") == "сумма":
+            lines.append(f"Доп.ходка: {_fmt_num(dh.get('summa'))} грн")
+        elif dh.get("tip") == "vhodit_v_tarif":
+            lines.append("Доп.ходка: входит в тариф")
+        elif dh.get("tip") == "utochnit":
+            lines.append("Доп.ходка: уточнить")
+
+    dt = tj.get("dop_tochka")
+    if dt:
+        if dt.get("tip") == "pereschet_minimalki":
+            lines.append(f"Доп.точка: новый минимум {_fmt_num(dt.get('summa'))} грн")
+        else:
+            lines.append(f"Доп.точка: +{_fmt_num(dt.get('summa'))} грн")
+
+    ves = tj.get("ves")
+    if ves:
+        if ves.get("tip") == "porogovaya" and ves.get("porogi"):
+            parts = [f"від {_fmt_num(p.get('ot'))}кг по {_fmt_num(p.get('stavka'))}грн" for p in ves["porogi"]]
+            lines.append("Вес: " + ", ".join(parts))
+        elif ves.get("stavka") is not None:
+            lines.append(f"Вес: {_fmt_num(ves.get('stavka'))} грн/кг")
+
+    if tj.get("etazhi_stavka") is not None:
+        lines.append(f"Этажи: {_fmt_num(tj['etazhi_stavka'])} грн")
+
+    if tj.get("prohody_stavka") is not None:
+        lines.append(f"Проходы: {_fmt_num(tj['prohody_stavka'])} грн")
+
+    for dop in tj.get("prochie_dopy") or []:
+        summa = dop.get("summa")
+        summa_str = f"{_fmt_num(summa)} грн" if summa is not None else "по факту"
+        lines.append(f"{dop.get('nazvanie', 'Доп')}: {summa_str}")
+
+    return lines
 
 
 # ---------------------------------------------------------------------------
@@ -669,6 +721,9 @@ def _apply_kom_gruzchiki(tariff, text):
 
 def _apply_platelshik(tariff, text):
     tariff["platelshik"] = _parse_platelshik(text)
+    # Подтверждённое правило: платежи от диспетчера всегда безналичные.
+    if tariff["platelshik"] == "Диспетчер" and not tariff.get("forma_oplaty"):
+        tariff["forma_oplaty"] = "БН"
 
 
 def _apply_forma_oplaty(tariff, text):
@@ -710,7 +765,7 @@ FIELD_DEFS = {
     },
     "platelshik": {
         "label": "Плательщик", "hint": "Клиент или Диспетчер",
-        "apply": _apply_platelshik, "columns": ["Плательщик"],
+        "apply": _apply_platelshik, "columns": ["Плательщик", "Форма_оплаты"],
     },
     "forma_oplaty": {
         "label": "Форма оплаты", "hint": "Нал или БН",
@@ -766,17 +821,27 @@ def tariff_edit_menu_keyboard(order_key: str) -> InlineKeyboardMarkup:
 # ---------------------------------------------------------------------------
 # Telegram: обработка нажатий кнопок ✅ / ✏️
 # ---------------------------------------------------------------------------
-def apply_default_hours(sheet, row, tariff: dict) -> dict:
-    """Если GPT не нашёл явных мин.часов в тексте (и это не фикс) -
-    подставляет умолчание по типу авто (см. default_min_hours_for_vehicle).
-    Мутирует и возвращает тот же dict для удобства цепочки вызовов."""
-    if tariff.get("tip_rascheta") == "фикс" or tariff.get("min_chasov") is not None:
-        return tariff
-    vt_col = ensure_vehicle_type_column(sheet)
-    vehicle_type_text = row[vt_col - 1] if vt_col and len(row) >= vt_col else ""
-    default_hours = default_min_hours_for_vehicle(vehicle_type_text)
-    if default_hours is not None:
-        tariff["min_chasov"] = default_hours
+def apply_defaults(sheet, row, tariff: dict) -> dict:
+    """Подставляет бизнес-умолчания, которые не должны зависеть от того,
+    упомянуты ли они явно в тексте заявки. Мутирует и возвращает тот же
+    dict для удобства цепочки вызовов.
+
+    1) Мин.часов по типу авто (см. default_min_hours_for_vehicle) - если
+       GPT не нашёл явных мин.часов в тексте и это не фикс.
+    2) Форма оплаты = БН, если плательщик - Диспетчер и форма оплаты не
+       указана явно. Подтверждено: у GoroD платежи от диспетчера всегда
+       безналичные, это не нужно каждый раз писать в заявке.
+    """
+    if tariff.get("tip_rascheta") != "фикс" and tariff.get("min_chasov") is None:
+        vt_col = ensure_vehicle_type_column(sheet)
+        vehicle_type_text = row[vt_col - 1] if vt_col and len(row) >= vt_col else ""
+        default_hours = default_min_hours_for_vehicle(vehicle_type_text)
+        if default_hours is not None:
+            tariff["min_chasov"] = default_hours
+
+    if tariff.get("platelshik") == "Диспетчер" and not tariff.get("forma_oplaty"):
+        tariff["forma_oplaty"] = "БН"
+
     return tariff
 
 
@@ -800,7 +865,7 @@ def get_or_reparse_tariff(sheet, row_num: int, order_key: str) -> dict:
     row = sheet.row_values(row_num)
     order_text = row[COL_J_TEXT - 1] if len(row) >= COL_J_TEXT else ""
     tariff = parse_tariff_via_gpt(order_text)
-    tariff = apply_default_hours(sheet, row, tariff)
+    tariff = apply_defaults(sheet, row, tariff)
     _pending_tariffs[order_key] = tariff
 
     if order_key not in _order_author_line:
@@ -995,7 +1060,7 @@ async def process_new_order(tg_app: Application, order_key: str):
     author_line = extract_order_author(order_text, fallback_author)
 
     tariff = parse_tariff_via_gpt(order_text)
-    tariff = apply_default_hours(sheet, row, tariff)
+    tariff = apply_defaults(sheet, row, tariff)
 
     _pending_tariffs[order_key] = tariff
     _order_author_line[order_key] = author_line
