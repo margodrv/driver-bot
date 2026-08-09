@@ -622,6 +622,35 @@ def _reconcile_neponyatno(result: dict):
     if gruzchiki_dopy:
         result["gruzchiki_dopy"] = gruzchiki_dopy
 
+    _dedup_ves_vs_gruzchiki_dopy(result, gruzchiki_dopy)
+
+
+def _dedup_ves_vs_gruzchiki_dopy(result: dict, gruzchiki_dopy: list):
+    """GPT иногда ДВАЖДЫ кодирует одни и те же лишние числа из строки
+    'Вантажники ...' - один раз честно в gruzchiki_dopy (или как надо),
+    и ещё раз придумывает из них пороговую таблицу веса (например
+    '4 вага/50 з вагою' -> ves: от 4кг по 50грн), хотя реального
+    порогового описания веса в тексте не было. Если числа из 'ves'
+    совпадают с уже сохранёнными gruzchiki_dopy - это дубль, убираем
+    поле 'ves' целиком, оставляя числа только в строке 'Грузчики'
+    (без попытки понять, что из них реально вес, а что - другая допа,
+    подтверждено логистом-владельцем как неоднозначный на глаз случай)."""
+    tj = result.get("tariff_json") or {}
+    ves = tj.get("ves")
+    if not ves or not gruzchiki_dopy:
+        return
+    dopy_set = {_fmt_num(n) for n in gruzchiki_dopy}
+    ves_numbers = set()
+    if ves.get("stavka") is not None:
+        ves_numbers.add(_fmt_num(ves["stavka"]))
+    for p in ves.get("porogi") or []:
+        if p.get("ot") is not None:
+            ves_numbers.add(_fmt_num(p["ot"]))
+        if p.get("stavka") is not None:
+            ves_numbers.add(_fmt_num(p["stavka"]))
+    if ves_numbers & dopy_set:
+        tj["ves"] = None
+
 
 def parse_tariff_via_gpt(order_text: str) -> dict:
     """Возвращает распарсенный тариф как dict (см. _TARIFF_SYSTEM_PROMPT).
@@ -688,6 +717,13 @@ def build_tariff_preview(tariff: dict, author_line: str = "", edited_fields: set
         dop = _fmt_num(tariff.get("avto_dop_chas"))
         hours_part = f" ({_fmt_num(min_h)}ч)" if min_h is not None else ""
         lines.append(f"Авто: {_fmt_num(base)}{hours_part}/{dop}{star(['avto_baza', 'avto_dop_chas', 'min_chasov'])}")
+
+    dt = (tariff.get("tariff_json") or {}).get("dop_tochka")
+    if dt:
+        if dt.get("tip") == "pereschet_minimalki":
+            lines.append(f"Доп.точка: новый минимум {_fmt_num(dt.get('summa'))} грн{star(['dop_tochka'])}")
+        else:
+            lines.append(f"Доп.точка: +{_fmt_num(dt.get('summa'))} грн{star(['dop_tochka'])}")
 
     gr_base = tariff.get("gruzchiki_baza")
     if gr_base is not None:
@@ -760,13 +796,6 @@ def _format_tariff_json_lines(tj: dict, edited_fields: set = frozenset()) -> lis
             lines.append("Доп.ходка: входит в тариф")
         elif dh.get("tip") == "utochnit":
             lines.append("Доп.ходка: уточнить")
-
-    dt = tj.get("dop_tochka")
-    if dt:
-        if dt.get("tip") == "pereschet_minimalki":
-            lines.append(f"Доп.точка: новый минимум {_fmt_num(dt.get('summa'))} грн{star(['dop_tochka'])}")
-        else:
-            lines.append(f"Доп.точка: +{_fmt_num(dt.get('summa'))} грн{star(['dop_tochka'])}")
 
     if tj.get("km_stavka") is not None:
         lines.append(f"Км: {_fmt_num(tj['km_stavka'])} грн/км{star(['km'])}")
