@@ -478,7 +478,7 @@ _NEPONYATNO_ITEM_RE = re.compile(r"^\s*([\d.,]+)\s*:\s*(.+)$")
 # Категории, которые имеют смысл только когда в заказе ЕСТЬ грузчики
 # (это надбавки к работе грузчиков, не к авто), плюс правдоподобный
 # потолок суммы для каждой - подтверждено логистом-владельцем.
-_LOADER_ONLY_CANDIDATES = {"этаж": 100, "проход": 100, "вес": 15}
+_LOADER_ONLY_CANDIDATES = {"этаж": 100, "проход": 50, "вес": 15}
 
 
 def _filter_neponyatno(result: dict) -> list:
@@ -611,7 +611,9 @@ def _reconcile_neponyatno(result: dict):
 
         if has_gruzchiki and any(k in cands_str.lower() for k in _LOADER_STRAY_KEYWORDS):
             try:
-                gruzchiki_dopy.append(float(num_str.replace(",", ".")))
+                val = float(num_str.replace(",", "."))
+                if val not in gruzchiki_dopy:  # не дублируем то, что уже там есть
+                    gruzchiki_dopy.append(val)
                 continue  # ушло в gruzchiki_dopy, предупреждение не нужно
             except ValueError:
                 pass
@@ -622,33 +624,26 @@ def _reconcile_neponyatno(result: dict):
     if gruzchiki_dopy:
         result["gruzchiki_dopy"] = gruzchiki_dopy
 
-    _dedup_ves_vs_gruzchiki_dopy(result, gruzchiki_dopy)
+    _strip_ves_when_gruzchiki(result)
 
 
-def _dedup_ves_vs_gruzchiki_dopy(result: dict, gruzchiki_dopy: list):
-    """GPT иногда ДВАЖДЫ кодирует одни и те же лишние числа из строки
-    'Вантажники ...' - один раз честно в gruzchiki_dopy (или как надо),
-    и ещё раз придумывает из них пороговую таблицу веса (например
-    '4 вага/50 з вагою' -> ves: от 4кг по 50грн), хотя реального
-    порогового описания веса в тексте не было. Если числа из 'ves'
-    совпадают с уже сохранёнными gruzchiki_dopy - это дубль, убираем
-    поле 'ves' целиком, оставляя числа только в строке 'Грузчики'
-    (без попытки понять, что из них реально вес, а что - другая допа,
-    подтверждено логистом-владельцем как неоднозначный на глаз случай)."""
-    tj = result.get("tariff_json") or {}
-    ves = tj.get("ves")
-    if not ves or not gruzchiki_dopy:
+def _strip_ves_when_gruzchiki(result: dict):
+    """GPT дважды подряд путал числа из строки 'Вантажники ...' с
+    пороговой таблицей веса - один раз с совпадающими числами (что ловил
+    предыдущий дедуп), второй раз со сломанной структурой (порог без
+    ставки: 'від 50кг по грн'). Раз даже сравнение чисел ненадёжно -
+    просто НЕ доверяем полю 'ves', когда в заказе вообще есть грузчики.
+    Подтверждено логистом-владельцем: такие числа - это допы, а не
+    структурированный вес, даже если среди них есть правдоподобное
+    значение (например действительно похожее на грн/кг) - разбираться,
+    что из чисел реально вес, логист будет сам, глядя на исходный текст.
+    Реальная пороговая таблица веса (случай F) настолько редка и
+    специфично описана в тексте, что подавляющее большинство срабатываний
+    этого поля при наличии грузчиков - ошибка, а не находка."""
+    if result.get("gruzchiki_baza") is None:
         return
-    dopy_set = {_fmt_num(n) for n in gruzchiki_dopy}
-    ves_numbers = set()
-    if ves.get("stavka") is not None:
-        ves_numbers.add(_fmt_num(ves["stavka"]))
-    for p in ves.get("porogi") or []:
-        if p.get("ot") is not None:
-            ves_numbers.add(_fmt_num(p["ot"]))
-        if p.get("stavka") is not None:
-            ves_numbers.add(_fmt_num(p["stavka"]))
-    if ves_numbers & dopy_set:
+    tj = result.get("tariff_json") or {}
+    if tj.get("ves"):
         tj["ves"] = None
 
 
@@ -803,8 +798,15 @@ def _format_tariff_json_lines(tj: dict, edited_fields: set = frozenset()) -> lis
     ves = tj.get("ves")
     if ves:
         if ves.get("tip") == "porogovaya" and ves.get("porogi"):
-            parts = [f"від {_fmt_num(p.get('ot'))}кг по {_fmt_num(p.get('stavka'))}грн" for p in ves["porogi"]]
-            lines.append("Вес: " + ", ".join(parts) + star(["ves"]))
+            # Пропускаем сломанные пороги (без начала или без ставки) -
+            # лучше не показать вообще, чем показать пустое "по грн".
+            parts = [
+                f"від {_fmt_num(p.get('ot'))}кг по {_fmt_num(p.get('stavka'))}грн"
+                for p in ves["porogi"]
+                if p.get("ot") is not None and p.get("stavka") is not None
+            ]
+            if parts:
+                lines.append("Вес: " + ", ".join(parts) + star(["ves"]))
         elif ves.get("stavka") is not None:
             lines.append(f"Вес: {_fmt_num(ves.get('stavka'))} грн/кг{star(['ves'])}")
 
@@ -1046,8 +1048,8 @@ def _apply_km(tariff, text):
 
 def _apply_etazhi(tariff, text):
     v = _parse_one_number(text)
-    if v > 100:
-        raise ValueError(f"{_fmt_num(v)} многовато для этажа (обычно до 100 грн) - проверьте цифру")
+    if v < 20 or v > 100:
+        raise ValueError(f"{_fmt_num(v)} не похоже на этаж (обычно 20-100 грн: 20-30 для 1-10 этажа, до 100 выше) - проверьте цифру")
     tj = tariff.setdefault("tariff_json", {})
     tj["etazhi_stavka"] = v
     _resolve_neponyatno(tariff)
@@ -1055,8 +1057,8 @@ def _apply_etazhi(tariff, text):
 
 def _apply_prohody(tariff, text):
     v = _parse_one_number(text)
-    if v > 100:
-        raise ValueError(f"{_fmt_num(v)} многовато для прохода (обычно до 100 грн) - проверьте цифру")
+    if v < 20 or v > 50:
+        raise ValueError(f"{_fmt_num(v)} не похоже на проход/допу (обычно 20-30 без весовых предметов, до 50 с ними) - проверьте цифру")
     tj = tariff.setdefault("tariff_json", {})
     tj["prohody_stavka"] = v
     _resolve_neponyatno(tariff)
@@ -1129,11 +1131,11 @@ FIELD_DEFS = {
         "apply": _apply_km, "columns": ["Тариф_JSON"],
     },
     "etazhi": {
-        "label": "Этажи", "hint": "например: 200 (грн)",
+        "label": "Этажи", "hint": "20-30 для 1-10 этажа, до 100 выше",
         "apply": _apply_etazhi, "columns": ["Тариф_JSON"],
     },
     "prohody": {
-        "label": "Проходы", "hint": "например: 150 (грн)",
+        "label": "Проходы", "hint": "20-30 обычно, до 50 с весовыми предметами",
         "apply": _apply_prohody, "columns": ["Тариф_JSON"],
     },
     "ves": {
