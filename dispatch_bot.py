@@ -115,6 +115,8 @@ TARIFF_COLUMN_NAMES = [
     "Авто_база",
     "Мин_часов",
     "Авто_доп_час",
+    "Грузчики_база",
+    "Грузчики_доп_час",
     "Ком_авто",
     "Ком_грузчики",
     "Плательщик",
@@ -169,24 +171,21 @@ def get_tariff_corrections_sheet():
         return spreadsheet.worksheet(TARIFF_CORRECTIONS_TAB_NAME)
     except gspread.exceptions.WorksheetNotFound:
         sheet = spreadsheet.add_worksheet(title=TARIFF_CORRECTIONS_TAB_NAME, rows=2000, cols=5)
-        sheet.append_row(["Время", "Order_key", "Текст заявки", "Разбор GPT (JSON)", "Правка логиста (текст)"])
+        sheet.append_row(["Время", "Order_key", "Поле", "Было", "Стало"])
         return sheet
 
 
-def log_tariff_correction(order_key: str, order_text: str, gpt_tariff: dict, correction_text: str):
-    """Сохраняет пару 'как разобрал GPT -> как исправил логист' - сырьё для
-    будущих few-shot примеров в промпте (см. обсуждение обучения). Сам
-    бот эту правку пока НЕ применяет к столбцам тарифа - это отдельная
-    задача (флоу 'применить правку' строится позже).
-    """
+def log_field_correction(order_key: str, field_label: str, old_value: str, new_value: str):
+    """Логирует точечную правку конкретного поля тарифа - сырьё для
+    будущих few-shot примеров в промпте (см. обсуждение обучения)."""
     try:
         get_tariff_corrections_sheet().append_row(
             [
                 datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 order_key,
-                order_text,
-                json.dumps(gpt_tariff, ensure_ascii=False),
-                correction_text,
+                field_label,
+                old_value,
+                new_value,
             ]
         )
     except Exception as e:
@@ -256,6 +255,40 @@ def col_letter(col_idx: int) -> str:
 _author_col_cache = None
 
 
+_vehicle_type_col_cache = None
+
+
+def ensure_vehicle_type_column(sheet):
+    """Ищет колонку с типом транспорта ('4.Тип транспорта (3т/5т/10т/ГБ/
+    будка)') по подстроке в заголовке, не по точному совпадению - в
+    реальном листе текст заголовка длинный и может переноситься на
+    несколько строк внутри ячейки."""
+    global _vehicle_type_col_cache
+    if _vehicle_type_col_cache is not None:
+        return _vehicle_type_col_cache
+    header_row = sheet.row_values(1)
+    for i, h in enumerate(header_row, start=1):
+        if "транспорт" in h.lower():
+            _vehicle_type_col_cache = i
+            return i
+    _vehicle_type_col_cache = False
+    return None
+
+
+def default_min_hours_for_vehicle(vehicle_type_text: str):
+    """Правило базовых часов (подтверждено логистом-владельцем):
+    5т/10т -> 3ч, 3т/Газель/Бус -> 2ч. Возвращает None, если тип не
+    распознан - тогда часы просто не подставляются, ничего не додумываем."""
+    if not vehicle_type_text:
+        return None
+    t = re.sub(r"\s+", "", vehicle_type_text.lower())
+    if "10т" in t or "5т" in t:
+        return 3
+    if "3т" in t or "бус" in t or "газел" in t:
+        return 2
+    return None
+
+
 def ensure_author_column(sheet):
     """Ищет колонку 'Автор_заявки' по заголовку (пишет её parsing-bot).
     Если колонки нет - возвращает None, фолбэк на автора просто не
@@ -307,6 +340,8 @@ _TARIFF_SYSTEM_PROMPT = """\
   "avto_baza": число или null,
   "min_chasov": число или null,
   "avto_dop_chas": число или null,
+  "gruzchiki_baza": число или null,
+  "gruzchiki_dop_chas": число или null,
   "tip_rascheta": "почасовка" | "фикс",
   "kom_avto": {"znachenie": число, "tip": "%" | "сумма"} или null,
   "kom_gruzchiki": {"znachenie": число, "tip": "%" | "сумма"} или null,
@@ -325,6 +360,19 @@ _TARIFF_SYSTEM_PROMPT = """\
 }
 
 Правила:
+- КРИТИЧНО не путать два РАЗНЫХ понятия про грузчиков:
+  1) "gruzchiki_baza"/"gruzchiki_dop_chas" - это СОБСТВЕННЫЙ тариф самих
+     грузчиков (сколько им платят за работу) - обычно указан как два
+     числа через "/" рядом со словом "вантажники"/"грузчики" (например
+     "Вантажники: 2400/1200" -> gruzchiki_baza=2400, gruzchiki_dop_chas=1200).
+  2) "kom_gruzchiki" - это КОМИССИЯ компании С работы грузчиков (процент
+     или фиксированная сумма, которую забирает компания/диспетчер) -
+     заполняй ТОЛЬКО если рядом явно есть слово "ком"/"коміс"/"комісія"
+     непосредственно у этого числа. Если такого слова нет - это НЕ
+     комиссия, это тариф грузчиков (пункт 1), даже если два числа похожи
+     по формату на "Авто_база/Авто_доп_час". Никогда не подставляй тариф
+     грузчиков в kom_gruzchiki просто потому что больше некуда - для
+     этого есть отдельные поля выше.
 - Числа через "/" в начале блока тарифа (например "5300/900/20") - это
   авто_база/авто_доп_час/третье число. Третье число НЕ имеет фиксированного
   смысла само по себе - определяй его назначение ТОЛЬКО по ближайшему
@@ -363,6 +411,7 @@ def parse_tariff_via_gpt(order_text: str) -> dict:
     """
     fallback = {
         "avto_baza": None, "min_chasov": None, "avto_dop_chas": None,
+        "gruzchiki_baza": None, "gruzchiki_dop_chas": None,
         "tip_rascheta": "почасовка", "kom_avto": None, "kom_gruzchiki": None,
         "platelshik": None, "forma_oplaty": None,
         "tariff_json": {}, "neponyatno": ["не удалось разобрать тариф (GPT недоступен)"],
@@ -407,10 +456,18 @@ def build_tariff_preview(tariff: dict, author_line: str = "") -> str:
     base = tariff.get("avto_baza")
     if tariff.get("tip_rascheta") == "фикс":
         lines.append(f"Авто: {_fmt_num(base)} (фикса)")
-    else:
-        min_h = _fmt_num(tariff.get("min_chasov"))
+    elif base is not None:
+        min_h = tariff.get("min_chasov")
         dop = _fmt_num(tariff.get("avto_dop_chas"))
-        lines.append(f"Авто: {_fmt_num(base)} ({min_h}ч)/{dop}")
+        hours_part = f" ({_fmt_num(min_h)}ч)" if min_h is not None else ""
+        lines.append(f"Авто: {_fmt_num(base)}{hours_part}/{dop}")
+
+    gr_base = tariff.get("gruzchiki_baza")
+    if gr_base is not None:
+        gr_dop = _fmt_num(tariff.get("gruzchiki_dop_chas"))
+        # Грузчики всегда на 2ч по подтверждённому бизнес-правилу - это
+        # константа, не значение из текста заявки или GPT.
+        lines.append(f"Грузчики: {_fmt_num(gr_base)} (2ч)/{gr_dop}")
 
     kom_avto = tariff.get("kom_avto")
     kom_gruz = tariff.get("kom_gruzchiki")
@@ -445,29 +502,179 @@ def build_tariff_preview(tariff: dict, author_line: str = "") -> str:
 
 
 # ---------------------------------------------------------------------------
-# Запись подтверждённого тарифа в Sheets
+# Запись тарифа в Sheets - целиком или отдельными полями
 # ---------------------------------------------------------------------------
-def write_tariff_to_sheet(sheet, row_num: int, tariff: dict):
+def _kom_cell(k):
+    if not k:
+        return ""
+    v = _fmt_num(k.get("znachenie"))
+    return f"{v}%" if k.get("tip") == "%" else f"{v}"
+
+
+def build_tariff_row_values(tariff: dict) -> dict:
+    """{имя_колонки: значение_для_записи} для всех тарифных колонок -
+    общий источник и для полной записи (при ✅), и для точечной записи
+    одного поля (при правке через карандаш)."""
+    return {
+        "Авто_база": _fmt_num(tariff.get("avto_baza")),
+        "Мин_часов": _fmt_num(tariff.get("min_chasov")),
+        "Авто_доп_час": _fmt_num(tariff.get("avto_dop_chas")),
+        "Грузчики_база": _fmt_num(tariff.get("gruzchiki_baza")),
+        "Грузчики_доп_час": _fmt_num(tariff.get("gruzchiki_dop_chas")),
+        "Ком_авто": _kom_cell(tariff.get("kom_avto")),
+        "Ком_грузчики": _kom_cell(tariff.get("kom_gruzchiki")),
+        "Плательщик": tariff.get("platelshik") or "",
+        "Тип_расчёта": tariff.get("tip_rascheta") or "",
+        "Форма_оплаты": tariff.get("forma_oplaty") or "",
+        "Тариф_JSON": json.dumps(tariff.get("tariff_json") or {}, ensure_ascii=False),
+    }
+
+
+def write_tariff_to_sheet(sheet, row_num: int, tariff: dict, columns: list = None):
+    """Пишет тариф в Sheets. Если columns не задан - пишет все 11 колонок
+    (используется при подтверждении ✅). Если задан список названий -
+    пишет только их (используется при точечной правке одного поля)."""
     cols = ensure_tariff_columns(sheet)
-
-    def kom_cell(k):
-        if not k:
-            return ""
-        v = _fmt_num(k.get("znachenie"))
-        return f"{v}%" if k.get("tip") == "%" else f"{v}"
-
+    values = build_tariff_row_values(tariff)
+    names = columns or TARIFF_COLUMN_NAMES
     updates = [
-        {"range": f"{col_letter(cols['Авто_база'])}{row_num}", "values": [[_fmt_num(tariff.get('avto_baza'))]]},
-        {"range": f"{col_letter(cols['Мин_часов'])}{row_num}", "values": [[_fmt_num(tariff.get('min_chasov'))]]},
-        {"range": f"{col_letter(cols['Авто_доп_час'])}{row_num}", "values": [[_fmt_num(tariff.get('avto_dop_chas'))]]},
-        {"range": f"{col_letter(cols['Ком_авто'])}{row_num}", "values": [[kom_cell(tariff.get('kom_avto'))]]},
-        {"range": f"{col_letter(cols['Ком_грузчики'])}{row_num}", "values": [[kom_cell(tariff.get('kom_gruzchiki'))]]},
-        {"range": f"{col_letter(cols['Плательщик'])}{row_num}", "values": [[tariff.get('platelshik') or ""]]},
-        {"range": f"{col_letter(cols['Тип_расчёта'])}{row_num}", "values": [[tariff.get('tip_rascheta') or ""]]},
-        {"range": f"{col_letter(cols['Форма_оплаты'])}{row_num}", "values": [[tariff.get('forma_oplaty') or ""]]},
-        {"range": f"{col_letter(cols['Тариф_JSON'])}{row_num}", "values": [[json.dumps(tariff.get('tariff_json') or {}, ensure_ascii=False)]]},
+        {"range": f"{col_letter(cols[name])}{row_num}", "values": [[values[name]]]}
+        for name in names
     ]
     sheet.batch_update(updates, value_input_option="RAW")
+
+
+# ---------------------------------------------------------------------------
+# Точечная правка полей тарифа (карандаш у каждой строки превью)
+# ---------------------------------------------------------------------------
+def _parse_two_numbers(text: str):
+    parts = text.strip().split("/")
+    if len(parts) != 2:
+        raise ValueError("нужно два числа через / , например 4750/950")
+    try:
+        return float(parts[0].strip().replace(",", ".")), float(parts[1].strip().replace(",", "."))
+    except ValueError:
+        raise ValueError("нужно два числа через / , например 4750/950")
+
+
+def _parse_one_number(text: str):
+    try:
+        return float(text.strip().replace(",", "."))
+    except ValueError:
+        raise ValueError("нужно одно число, например 3")
+
+
+def _parse_kom(text: str):
+    t = text.strip()
+    if not t:
+        raise ValueError("нужно число, например 10% или 500")
+    if t.endswith("%"):
+        try:
+            return {"znachenie": float(t[:-1].strip().replace(",", ".")), "tip": "%"}
+        except ValueError:
+            raise ValueError("нужно число перед %, например 10%")
+    try:
+        return {"znachenie": float(t.replace(",", ".")), "tip": "сумма"}
+    except ValueError:
+        raise ValueError("нужно число, например 10% или 500")
+
+
+def _parse_platelshik(text: str):
+    t = text.strip().lower()
+    if t.startswith("клі") or t.startswith("кли"):
+        return "Клиент"
+    if t.startswith("дисп"):
+        return "Диспетчер"
+    raise ValueError("напишите 'Клиент' или 'Диспетчер'")
+
+
+def _parse_tip_rascheta(text: str):
+    t = text.strip().lower()
+    if "фикс" in t or "фікс" in t:
+        return "фикс"
+    if "почас" in t:
+        return "почасовка"
+    raise ValueError("напишите 'фикс' или 'почасовка'")
+
+
+def _parse_forma_oplaty(text: str):
+    t = text.strip().lower()
+    if t in ("нал", "готівка", "готовка", "cash"):
+        return "Нал"
+    if t in ("бн", "безнал", "карта", "card"):
+        return "БН"
+    raise ValueError("напишите 'Нал' или 'БН'")
+
+
+def _apply_avto(tariff, text):
+    a, b = _parse_two_numbers(text)
+    tariff["avto_baza"], tariff["avto_dop_chas"] = a, b
+
+
+def _apply_min_chasov(tariff, text):
+    tariff["min_chasov"] = _parse_one_number(text)
+
+
+def _apply_gruzchiki(tariff, text):
+    a, b = _parse_two_numbers(text)
+    tariff["gruzchiki_baza"], tariff["gruzchiki_dop_chas"] = a, b
+
+
+def _apply_kom_avto(tariff, text):
+    tariff["kom_avto"] = _parse_kom(text)
+
+
+def _apply_kom_gruzchiki(tariff, text):
+    tariff["kom_gruzchiki"] = _parse_kom(text)
+
+
+def _apply_platelshik(tariff, text):
+    tariff["platelshik"] = _parse_platelshik(text)
+
+
+def _apply_tip_rascheta(tariff, text):
+    tariff["tip_rascheta"] = _parse_tip_rascheta(text)
+
+
+def _apply_forma_oplaty(tariff, text):
+    tariff["forma_oplaty"] = _parse_forma_oplaty(text)
+
+
+# field_key -> {label, hint, apply(tariff, text), columns затрагиваемые в Sheets}
+FIELD_DEFS = {
+    "avto": {
+        "label": "Авто (база/доп.час)", "hint": "например: 4750/950",
+        "apply": _apply_avto, "columns": ["Авто_база", "Авто_доп_час"],
+    },
+    "min_chasov": {
+        "label": "Мин. часов", "hint": "например: 3",
+        "apply": _apply_min_chasov, "columns": ["Мин_часов"],
+    },
+    "gruzchiki": {
+        "label": "Грузчики (база/доп.час)", "hint": "например: 2400/1200",
+        "apply": _apply_gruzchiki, "columns": ["Грузчики_база", "Грузчики_доп_час"],
+    },
+    "kom_avto": {
+        "label": "Ком. авто", "hint": "например: 10% или 500",
+        "apply": _apply_kom_avto, "columns": ["Ком_авто"],
+    },
+    "kom_gruzchiki": {
+        "label": "Ком. грузчики", "hint": "например: 10% или 500",
+        "apply": _apply_kom_gruzchiki, "columns": ["Ком_грузчики"],
+    },
+    "platelshik": {
+        "label": "Плательщик", "hint": "Клиент или Диспетчер",
+        "apply": _apply_platelshik, "columns": ["Плательщик"],
+    },
+    "tip_rascheta": {
+        "label": "Тип расчёта", "hint": "фикс или почасовка",
+        "apply": _apply_tip_rascheta, "columns": ["Тип_расчёта"],
+    },
+    "forma_oplaty": {
+        "label": "Форма оплаты", "hint": "Нал или БН",
+        "apply": _apply_forma_oplaty, "columns": ["Форма_оплаты"],
+    },
+}
 
 
 # ---------------------------------------------------------------------------
@@ -480,15 +687,53 @@ def write_tariff_to_sheet(sheet, row_num: int, tariff: dict):
 # order_key -> распарсенный тариф, ждущий подтверждения (см. комментарий выше)
 _pending_tariffs: dict[str, dict] = {}
 
-# (chat_id, message_id превью-сообщения бота) -> order_key. Заполняется при
-# нажатии "✏️ Исправить", чтобы понять, к какому заказу относится текстовый
-# reply логиста, когда он придёт следующим сообщением.
-_awaiting_correction: dict[tuple[int, int], str] = {}
+# order_key -> строка автора/менеджера (нужна, чтобы восстановить её при
+# перерисовке превью после отмены правки или рестарта).
+_order_author_line: dict[str, str] = {}
+
+# (chat_id, message_id превью-сообщения бота) -> (order_key, field_key).
+# Заполняется при нажатии кнопки конкретного поля в меню правки, чтобы
+# понять, какое поле правит логист, когда придёт текстовый reply.
+_awaiting_field_edit: dict[tuple[int, int], tuple[str, str]] = {}
+
+
+def tariff_level1_keyboard(order_key: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Верно", callback_data=f"tariff_ok|{order_key}"),
+        InlineKeyboardButton("✏️ Исправить", callback_data=f"tariff_editmenu|{order_key}"),
+    ]])
+
+
+def tariff_edit_menu_keyboard(order_key: str) -> InlineKeyboardMarkup:
+    keys = list(FIELD_DEFS.keys())
+    rows = []
+    for i in range(0, len(keys), 2):
+        row_keys = keys[i:i + 2]
+        rows.append([
+            InlineKeyboardButton(f"✏️ {FIELD_DEFS[k]['label']}", callback_data=f"editfield|{k}|{order_key}")
+            for k in row_keys
+        ])
+    rows.append([InlineKeyboardButton("⬅️ Назад", callback_data=f"editback|{order_key}")])
+    return InlineKeyboardMarkup(rows)
 
 
 # ---------------------------------------------------------------------------
 # Telegram: обработка нажатий кнопок ✅ / ✏️
 # ---------------------------------------------------------------------------
+def apply_default_hours(sheet, row, tariff: dict) -> dict:
+    """Если GPT не нашёл явных мин.часов в тексте (и это не фикс) -
+    подставляет умолчание по типу авто (см. default_min_hours_for_vehicle).
+    Мутирует и возвращает тот же dict для удобства цепочки вызовов."""
+    if tariff.get("tip_rascheta") == "фикс" or tariff.get("min_chasov") is not None:
+        return tariff
+    vt_col = ensure_vehicle_type_column(sheet)
+    vehicle_type_text = row[vt_col - 1] if vt_col and len(row) >= vt_col else ""
+    default_hours = default_min_hours_for_vehicle(vehicle_type_text)
+    if default_hours is not None:
+        tariff["min_chasov"] = default_hours
+    return tariff
+
+
 def get_or_reparse_tariff(sheet, row_num: int, order_key: str) -> dict:
     """Возвращает тариф из памяти, а если бот перезапускался и памяти нет -
     молча пересчитывает его заново из текста заявки в Sheets.
@@ -509,7 +754,14 @@ def get_or_reparse_tariff(sheet, row_num: int, order_key: str) -> dict:
     row = sheet.row_values(row_num)
     order_text = row[COL_J_TEXT - 1] if len(row) >= COL_J_TEXT else ""
     tariff = parse_tariff_via_gpt(order_text)
+    tariff = apply_default_hours(sheet, row, tariff)
     _pending_tariffs[order_key] = tariff
+
+    if order_key not in _order_author_line:
+        author_col = ensure_author_column(sheet)
+        fallback_author = row[author_col - 1] if author_col and len(row) >= author_col else ""
+        _order_author_line[order_key] = extract_order_author(order_text, fallback_author)
+
     return tariff
 
 
@@ -517,17 +769,18 @@ async def handle_tariff_callback(update: Update, context: ContextTypes.DEFAULT_T
     query = update.callback_query
     await query.answer()
 
-    action, order_key = query.data.split("|", 1)
-
-    sheet = get_sheet()
-    row_num = find_row_by_key(sheet, order_key)
-    if not row_num:
-        await query.edit_message_text(f"⚠️ Не нашёл строку заказа по ключу {order_key} в таблице.")
-        return
-
-    pending = get_or_reparse_tariff(sheet, row_num, order_key)
+    parts = query.data.split("|")
+    action = parts[0]
+    msg_key = (query.message.chat_id, query.message.message_id)
 
     if action == "tariff_ok":
+        order_key = parts[1]
+        sheet = get_sheet()
+        row_num = find_row_by_key(sheet, order_key)
+        if not row_num:
+            await query.edit_message_text(f"⚠️ Не нашёл строку заказа по ключу {order_key} в таблице.")
+            return
+        pending = get_or_reparse_tariff(sheet, row_num, order_key)
         try:
             write_tariff_to_sheet(sheet, row_num, pending)
         except Exception as e:
@@ -536,54 +789,95 @@ async def handle_tariff_callback(update: Update, context: ContextTypes.DEFAULT_T
             await query.edit_message_text(f"⚠️ Не удалось записать тариф в таблицу: {e}")
             return
         _pending_tariffs.pop(order_key, None)
+        _order_author_line.pop(order_key, None)
         log_event("Тариф подтверждён и записан", row=row_num)
         await query.edit_message_text(query.message.text + "\n\n✅ Подтверждено")
 
-    elif action == "tariff_fix":
-        # Полноценный флоу применения правки (по полям и т.п.) - отдельная
-        # задача на будущее. Пока просим прислать верный тариф текстом,
-        # реплаем на это же сообщение, и просто ЛОГИРУЕМ пару "как
-        # разобрал GPT -> как исправил логист" - сырьё для будущих
-        # few-shot примеров в промпте (см. handle_tariff_correction_reply).
-        _awaiting_correction[(query.message.chat_id, query.message.message_id)] = order_key
+    elif action == "tariff_editmenu":
+        order_key = parts[1]
+        await query.edit_message_reply_markup(reply_markup=tariff_edit_menu_keyboard(order_key))
+
+    elif action == "editback":
+        order_key = parts[1]
+        _awaiting_field_edit.pop(msg_key, None)
+        sheet = get_sheet()
+        row_num = find_row_by_key(sheet, order_key)
+        pending = get_or_reparse_tariff(sheet, row_num, order_key) if row_num else {}
+        author_line = _order_author_line.get(order_key, "")
         await query.edit_message_text(
-            query.message.text + "\n\n✏️ Пришлите верный тариф текстом, ответом на это сообщение."
+            build_tariff_preview(pending, author_line),
+            reply_markup=tariff_level1_keyboard(order_key),
+        )
+
+    elif action == "editfield":
+        field_key, order_key = parts[1], parts[2]
+        fdef = FIELD_DEFS[field_key]
+        _awaiting_field_edit[msg_key] = (order_key, field_key)
+        cancel_kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("❌ Отмена", callback_data=f"editback|{order_key}")
+        ]])
+        await query.edit_message_text(
+            query.message.text + f"\n\n✏️ Пришлите новое значение для «{fdef['label']}» "
+                                  f"({fdef['hint']}), ответом на это сообщение.",
+            reply_markup=cancel_kb,
         )
 
 
 async def handle_tariff_correction_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Ловит текстовый reply логиста на сообщение 'пришлите верный тариф' и
-    логирует пару (текст заявки, разбор GPT, правка логиста) в
-    Tariff_corrections. Правка пока НЕ применяется автоматически к
-    столбцам тарифа - это отдельная будущая задача.
-    """
+    """Ловит текстовый reply логиста на сообщение 'пришлите новое значение
+    для <поле>' - применяет правку СРАЗУ к нужной ячейке в Sheets (не
+    перезаписывая весь тариф), обновляет превью и логирует старое/новое
+    значение в Tariff_corrections для будущего анализа."""
     msg = update.message
     replied = msg.reply_to_message
     if not replied:
         return
 
-    key = (msg.chat_id, replied.message_id)
-    order_key = _awaiting_correction.get(key)
-    if not order_key:
+    msg_key = (msg.chat_id, replied.message_id)
+    awaiting = _awaiting_field_edit.get(msg_key)
+    if not awaiting:
         return  # обычный reply, к правке тарифа отношения не имеет
 
-    pending = _pending_tariffs.get(order_key, {})
+    order_key, field_key = awaiting
+    fdef = FIELD_DEFS[field_key]
+
     sheet = get_sheet()
     row_num = find_row_by_key(sheet, order_key)
-    order_text = ""
-    if row_num:
-        row = sheet.row_values(row_num)
-        order_text = row[COL_J_TEXT - 1] if len(row) >= COL_J_TEXT else ""
+    if not row_num:
+        await msg.reply_text(f"⚠️ Не нашёл строку заказа по ключу {order_key} в таблице.")
+        return
 
-    log_tariff_correction(order_key, order_text, pending, msg.text or "")
-    _awaiting_correction.pop(key, None)
+    pending = get_or_reparse_tariff(sheet, row_num, order_key)
+    old_values = build_tariff_row_values(pending)
+    old_str = " / ".join(old_values[c] for c in fdef["columns"] if old_values[c]) or "(пусто)"
 
-    await msg.reply_text(
-        "Записано, спасибо. Пока сама правка в таблицу не применяется "
-        "автоматически - при необходимости внесите верный тариф в "
-        "соответствующие столбцы вручную."
+    try:
+        fdef["apply"](pending, msg.text or "")
+    except ValueError as e:
+        await msg.reply_text(f"⚠️ Не понял значение: {e}")
+        return
+
+    try:
+        write_tariff_to_sheet(sheet, row_num, pending, columns=fdef["columns"])
+    except Exception as e:
+        logger.error(f"Не удалось записать правку поля '{field_key}' в Sheets, key={order_key}: {e}")
+        await msg.reply_text(f"⚠️ Не удалось записать в таблицу: {e}")
+        return
+
+    _pending_tariffs[order_key] = pending
+    _awaiting_field_edit.pop(msg_key, None)
+
+    new_values = build_tariff_row_values(pending)
+    new_str = " / ".join(new_values[c] for c in fdef["columns"] if new_values[c]) or "(пусто)"
+    log_field_correction(order_key, fdef["label"], old_str, new_str)
+    log_event(f"Правка поля '{fdef['label']}' записана в Sheets", row=row_num)
+
+    author_line = _order_author_line.get(order_key, "")
+    await replied.edit_text(
+        build_tariff_preview(pending, author_line),
+        reply_markup=tariff_level1_keyboard(order_key),
     )
-    log_event("Правка тарифа записана в Tariff_corrections", row=row_num)
+    await msg.reply_text(f"✅ Записано в таблицу: {fdef['label']} = {new_str}")
 
 
 # ---------------------------------------------------------------------------
@@ -640,19 +934,18 @@ async def process_new_order(tg_app: Application, order_key: str):
     author_line = extract_order_author(order_text, fallback_author)
 
     tariff = parse_tariff_via_gpt(order_text)
+    tariff = apply_default_hours(sheet, row, tariff)
+
     _pending_tariffs[order_key] = tariff
+    _order_author_line[order_key] = author_line
 
     preview = build_tariff_preview(tariff, author_line)
-    keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Верно", callback_data=f"tariff_ok|{order_key}"),
-        InlineKeyboardButton("✏️ Исправить", callback_data=f"tariff_fix|{order_key}"),
-    ]])
 
     await tg_app.bot.send_message(
         chat_id=int(chat_id),
         text=preview,
         reply_to_message_id=int(message_id),
-        reply_markup=keyboard,
+        reply_markup=tariff_level1_keyboard(order_key),
     )
     log_event("Превью тарифа отправлено", chat_id, message_id, row_num)
 
