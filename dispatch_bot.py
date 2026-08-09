@@ -361,6 +361,7 @@ _TARIFF_SYSTEM_PROMPT = """\
     "gidrobort": {"summa": число, "po_faktu": true} или null,
     "dop_hodka": {"tip": "сумма"|"vhodit_v_tarif"|"utochnit", "summa": число или null} или null,
     "dop_tochka": {"tip": "doplata_fix"|"pereschet_minimalki", "summa": число или null} или null,
+    "km_stavka": число или null,
     "ves": {"tip": "ploskaya", "stavka": число} или {"tip": "porogovaya", "porogi": [{"ot": число, "stavka": число}]} или null,
     "etazhi_stavka": число или null,
     "prohody_stavka": число или null,
@@ -419,15 +420,21 @@ _TARIFF_SYSTEM_PROMPT = """\
 - Числа через "/" в начале блока тарифа (например "5300/900/20") - это
   авто_база/авто_доп_час/третье число. Третье число НЕ имеет фиксированного
   смысла само по себе - определяй его назначение ТОЛЬКО по ближайшему
-  ключевому слову рядом с ним: "км"/"кілометр" -> не входит в текущую
-  структуру, помечай в neponyatno; "этаж"/"поверх" -> etazhi_stavka;
-  "прохід"/"проход"/"заносов" -> prohody_stavka; "точка"/"Т3" -> dop_tochka.
+  ключевому слову рядом с ним: "км"/"кілометр" -> km_stavka; "этаж"/"поверх"
+  -> etazhi_stavka; "прохід"/"проход"/"заносов" -> prohody_stavka;
+  "точка"/"Т3" -> dop_tochka.
   Если рядом с числом нет ни одного из этих триггер-слов - это ОБЯЗАТЕЛЬНО
   должно попасть в neponyatno, никогда не теряй число молча. Формат КОРОТКИЙ
   - число и кандидаты через "/", БЕЗ полных предложений: "<число>:
-  ГБ?/точка?/км?/этаж?/проход?". Пример: "Тар 6000/1200/600" без слов рядом
-  с "600" -> avto_baza=6000, avto_dop_chas=1200, neponyatno=["600:
-  ГБ?/точка?/км?/этаж?/проход?"].
+  ГБ?/точка?/км?/этаж?/проход?". ВАЖНО - подставляй в кандидаты только
+  правдоподобные по размеру варианты: "этаж?"/"проход?" предлагай ТОЛЬКО
+  если число ≤100 (ставка за этаж/проход - это обычно десятки, не сотни);
+  "вес?" предлагай ТОЛЬКО если число ≤15 (ставка за кг - обычно несколько
+  гривен). Если число больше этих порогов - эти варианты вообще не
+  включай в список кандидатов, даже если больше нечего предложить.
+  Пример: "Тар 6000/1200/600" без слов рядом с "600" -> avto_baza=6000,
+  avto_dop_chas=1200, neponyatno=["600: ГБ?/точка?/км?"] (без "этаж?"/
+  "проход?" - 600 слишком много для них).
 - Гидроборт (gidrobort) заполняй ТОЛЬКО если в тексте явно написано что-то
   вида "гідроборт +950 якщо використовують" - то есть оплата по факту
   использования, а не автоматическая доплата. Если гидроборт просто
@@ -593,6 +600,9 @@ def _format_tariff_json_lines(tj: dict) -> list:
             lines.append(f"Доп.точка: новый минимум {_fmt_num(dt.get('summa'))} грн")
         else:
             lines.append(f"Доп.точка: +{_fmt_num(dt.get('summa'))} грн")
+
+    if tj.get("km_stavka") is not None:
+        lines.append(f"Км: {_fmt_num(tj['km_stavka'])} грн/км")
 
     ves = tj.get("ves")
     if ves:
@@ -817,15 +827,27 @@ def _apply_dop_tochka(tariff, text):
     _resolve_neponyatno(tariff)
 
 
-def _apply_etazhi(tariff, text):
+def _apply_km(tariff, text):
     tj = tariff.setdefault("tariff_json", {})
-    tj["etazhi_stavka"] = _parse_one_number(text)
+    tj["km_stavka"] = _parse_one_number(text)
+    _resolve_neponyatno(tariff)
+
+
+def _apply_etazhi(tariff, text):
+    v = _parse_one_number(text)
+    if v > 100:
+        raise ValueError(f"{_fmt_num(v)} многовато для этажа (обычно до 100 грн) - проверьте цифру")
+    tj = tariff.setdefault("tariff_json", {})
+    tj["etazhi_stavka"] = v
     _resolve_neponyatno(tariff)
 
 
 def _apply_prohody(tariff, text):
+    v = _parse_one_number(text)
+    if v > 100:
+        raise ValueError(f"{_fmt_num(v)} многовато для прохода (обычно до 100 грн) - проверьте цифру")
     tj = tariff.setdefault("tariff_json", {})
-    tj["prohody_stavka"] = _parse_one_number(text)
+    tj["prohody_stavka"] = v
     _resolve_neponyatno(tariff)
 
 
@@ -877,6 +899,10 @@ FIELD_DEFS = {
     "dop_tochka": {
         "label": "Доп.точка", "hint": "например: 500",
         "apply": _apply_dop_tochka, "columns": ["Тариф_JSON"],
+    },
+    "km": {
+        "label": "Км", "hint": "например: 15 (грн/км)",
+        "apply": _apply_km, "columns": ["Тариф_JSON"],
     },
     "etazhi": {
         "label": "Этажи", "hint": "например: 200 (грн)",
