@@ -253,6 +253,47 @@ def col_letter(col_idx: int) -> str:
     return letter
 
 
+_author_col_cache = None
+
+
+def ensure_author_column(sheet):
+    """Ищет колонку 'Автор_заявки' по заголовку (пишет её parsing-bot).
+    Если колонки нет - возвращает None, фолбэк на автора просто не
+    сработает, но остальная работа бота не прерывается."""
+    global _author_col_cache
+    if _author_col_cache is not None:
+        return _author_col_cache
+    header_row = sheet.row_values(1)
+    try:
+        _author_col_cache = header_row.index("Автор_заявки") + 1
+    except ValueError:
+        _author_col_cache = False
+    return _author_col_cache or None
+
+
+# Строка вида "Менеджер Сергій @TK_Gorod" / "Логіст Ірина @Anna_G0R0D" и
+# т.п. - берём остаток строки после ключевого слова как имя менеджера.
+_MANAGER_LINE_RE = re.compile(r"(?im)^\s*(?:менеджер|логіст|логист)\s*[:\-]?\s*(.+)$")
+_USERNAME_RE = re.compile(r"@[A-Za-z0-9_]{4,}")
+
+
+def extract_order_author(order_text: str, fallback_author: str) -> str:
+    """Имя/тег для строки-подписи в превью тарифа: сначала пробуем найти
+    явное 'Менеджер ...'/'Логіст ...' в тексте заявки (это тот, кто
+    реально ведёт этого клиента - может отличаться от того, кто физически
+    прислал сообщение в группу), и только если такой строки нет -
+    используем автора сообщения из колонки 'Автор_заявки'.
+    """
+    m = _MANAGER_LINE_RE.search(order_text)
+    if m:
+        captured = m.group(1).strip()
+        username_match = _USERNAME_RE.search(captured)
+        if username_match:
+            return username_match.group(0)
+        return captured
+    return fallback_author or ""
+
+
 # ---------------------------------------------------------------------------
 # GPT-разбор тарифа
 # ---------------------------------------------------------------------------
@@ -357,8 +398,11 @@ def _fmt_num(n) -> str:
     return str(n)
 
 
-def build_tariff_preview(tariff: dict) -> str:
-    lines = ["📋 Тариф по заказу"]
+def build_tariff_preview(tariff: dict, author_line: str = "") -> str:
+    lines = []
+    if author_line:
+        lines.append(author_line)
+    lines.append("📋 Тариф по заказу")
 
     base = tariff.get("avto_baza")
     if tariff.get("tip_rascheta") == "фикс":
@@ -591,10 +635,14 @@ async def process_new_order(tg_app: Application, order_key: str):
         log_event(f"Тариф: недостаточно данных в строке для key={order_key}", chat_id, message_id, row_num)
         return
 
+    author_col = ensure_author_column(sheet)
+    fallback_author = cell(author_col) if author_col else ""
+    author_line = extract_order_author(order_text, fallback_author)
+
     tariff = parse_tariff_via_gpt(order_text)
     _pending_tariffs[order_key] = tariff
 
-    preview = build_tariff_preview(tariff)
+    preview = build_tariff_preview(tariff, author_line)
     keyboard = InlineKeyboardMarkup([[
         InlineKeyboardButton("✅ Верно", callback_data=f"tariff_ok|{order_key}"),
         InlineKeyboardButton("✏️ Исправить", callback_data=f"tariff_fix|{order_key}"),
