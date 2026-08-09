@@ -462,6 +462,84 @@ _TARIFF_SYSTEM_PROMPT = """\
 """
 
 
+_NEPONYATNO_ITEM_RE = re.compile(r"^\s*([\d.,]+)\s*:\s*(.+)$")
+
+# Категории, которые имеют смысл только когда в заказе ЕСТЬ грузчики
+# (это надбавки к работе грузчиков, не к авто), плюс правдоподобный
+# потолок суммы для каждой - подтверждено логистом-владельцем.
+_LOADER_ONLY_CANDIDATES = {"этаж": 100, "проход": 100, "вес": 15}
+
+
+def _filter_neponyatno(result: dict) -> list:
+    """GPT не всегда строго следует текстовому правилу про правдоподобные
+    величины и про 'нет грузчиков - не предлагай этаж/проход/вес' - даже
+    после явного примера в промпте (see 09.08: '500' с этими вариантами
+    при заказе без грузчиков вообще). Правим кодом, а не только текстом
+    инструкции - так гарантированно, а не 'обычно работает'.
+    """
+    has_gruzchiki = result.get("gruzchiki_baza") is not None
+    filtered = []
+    for item in result.get("neponyatno") or []:
+        m = _NEPONYATNO_ITEM_RE.match(item)
+        if not m:
+            filtered.append(item)
+            continue
+        num_str, cands_str = m.groups()
+        try:
+            num = float(num_str.replace(",", "."))
+        except ValueError:
+            filtered.append(item)
+            continue
+        kept = []
+        for cand in (c.strip() for c in cands_str.split("/") if c.strip()):
+            low = cand.lower()
+            cap = next((v for k, v in _LOADER_ONLY_CANDIDATES.items() if low.startswith(k)), None)
+            if cap is not None and (not has_gruzchiki or num > cap):
+                continue  # нет грузчиков в заказе или сумма неправдоподобна для этой категории
+            kept.append(cand)
+        if not kept:
+            # Все кандидаты отфильтрованы (были только про грузчиков, а
+            # грузчиков в заказе нет / сумма неправдоподобна) - НЕ
+            # возвращаем отфильтрованное обратно, подставляем безопасные
+            # общие варианты, у которых нет потолка по сумме.
+            kept = ["ГБ?", "точка?", "км?"]
+        filtered.append(f"{num_str}: " + "/".join(kept))
+    return filtered
+
+
+# field_key -> короткая метка кандидата, как она пишется в "не понял"
+# (в нижнем регистре, без "?"). Используется, чтобы при нажатии кнопки
+# резолва не переспрашивать число, которое уже написано в предупреждении.
+_CANDIDATE_FIELD_LABELS = {
+    "gidrobort": "гб",
+    "dop_tochka": "точка",
+    "km": "км",
+    "etazhi": "этаж",
+    "prohody": "проход",
+    "ves": "вес",
+}
+
+
+def find_pending_neponyatno_value(tariff: dict, field_key: str):
+    """Если для этого поля есть подходящее число в 'не понял' (например
+    '600: ГБ?/точка?/км?' и поле - gidrobort) - возвращает это число как
+    строку, чтобы применить его сразу, без переспроса. Если совпадения
+    нет (в том числе если это обычное поле вроде 'Авто база', для
+    которого кандидатов не бывает) - возвращает None, обычный флоу."""
+    label = _CANDIDATE_FIELD_LABELS.get(field_key)
+    if not label:
+        return None
+    for item in tariff.get("neponyatno") or []:
+        m = _NEPONYATNO_ITEM_RE.match(item)
+        if not m:
+            continue
+        num_str, cands_str = m.groups()
+        cands = [c.strip().rstrip("?").lower() for c in cands_str.split("/") if c.strip()]
+        if label in cands:
+            return num_str
+    return None
+
+
 def parse_tariff_via_gpt(order_text: str) -> dict:
     """Возвращает распарсенный тариф как dict (см. _TARIFF_SYSTEM_PROMPT).
     При любой ошибке (нет клиента, невалидный JSON, таймаут) возвращает
@@ -489,7 +567,9 @@ def parse_tariff_via_gpt(order_text: str) -> dict:
         )
         raw = completion.choices[0].message.content.strip()
         raw = re.sub(r"^```json\s*|\s*```$", "", raw.strip())
-        return json.loads(raw)
+        result = json.loads(raw)
+        result["neponyatno"] = _filter_neponyatno(result)
+        return result
     except Exception as e:
         logger.error(f"Ошибка разбора тарифа через GPT: {e}")
         fallback["neponyatno"] = [f"не удалось разобрать тариф (ошибка: {e})"]
@@ -527,16 +607,17 @@ def build_tariff_preview(tariff: dict, author_line: str = "", edited_fields: set
     gr_base = tariff.get("gruzchiki_baza")
     if gr_base is not None:
         gr_dop = _fmt_num(tariff.get("gruzchiki_dop_chas"))
-        # Грузчики всегда на 2ч по подтверждённому бизнес-правилу - это
-        # константа, не значение из текста заявки или GPT.
-        gr_line = f"Грузчики: {_fmt_num(gr_base)} (2ч)/{gr_dop}"
+        # По умолчанию 2ч (подтверждённое бизнес-правило), но теперь
+        # можно поправить вручную через кнопку "Часы" у грузчиков.
+        gr_chasov = _fmt_num(tariff.get("gruzchiki_chasov")) or "2"
+        gr_line = f"Грузчики: {_fmt_num(gr_base)} ({gr_chasov}ч)/{gr_dop}"
         gr_extra = tariff.get("gruzchiki_dopy") or []
         if gr_extra:
             # Доп.числа (вес/этаж/проход и т.п.) НЕ классифицируем - просто
             # дописываем по порядку как в тексте заявки, логист сам знает,
             # что есть что, глядя на исходную заявку рядом.
             gr_line += "/" + "/".join(_fmt_num(n) for n in gr_extra)
-        lines.append(gr_line + star(["gruzchiki_baza", "gruzchiki_dop_chas", "gruzchiki_dopy"]))
+        lines.append(gr_line + star(["gruzchiki_baza", "gruzchiki_dop_chas", "gruzchiki_dopy", "gruzchiki_chasov"]))
 
     kom_avto = tariff.get("kom_avto")
     kom_gruz = tariff.get("kom_gruzchiki")
@@ -660,6 +741,8 @@ def build_tariff_row_values(tariff: dict) -> dict:
     gr_dopy = tariff.get("gruzchiki_dopy") or []
     if gr_dopy:
         tj["gruzchiki_dopy"] = gr_dopy
+    if tariff.get("gruzchiki_chasov") is not None:
+        tj["gruzchiki_chasov"] = tariff["gruzchiki_chasov"]
 
     return {
         "Авто_база": _fmt_num(tariff.get("avto_baza")),
@@ -789,6 +872,10 @@ def _apply_gruzchiki_dop_chas(tariff, text):
     tariff["gruzchiki_dop_chas"] = None if t in _EMPTY_VALUES else _parse_one_number(text)
 
 
+def _apply_gruzchiki_chasov(tariff, text):
+    tariff["gruzchiki_chasov"] = _parse_one_number(text)
+
+
 def _apply_kom_avto(tariff, text):
     tariff["kom_avto"] = _parse_kom(text)
 
@@ -876,7 +963,7 @@ FIELD_DEFS = {
         "apply": _apply_avto_dop_chas, "columns": ["Авто_доп_час", "Тип_расчёта"],
     },
     "min_chasov": {
-        "label": "Мин. часов", "hint": "например: 3",
+        "label": "Часы", "hint": "например: 3",
         "apply": _apply_min_chasov, "columns": ["Мин_часов"],
     },
     "gruzchiki_baza": {
@@ -886,6 +973,10 @@ FIELD_DEFS = {
     "gruzchiki_dop_chas": {
         "label": "Грузчики доп.час", "hint": "например: 1200",
         "apply": _apply_gruzchiki_dop_chas, "columns": ["Грузчики_доп_час"],
+    },
+    "gruzchiki_chasov": {
+        "label": "Часы (грузчики)", "hint": "например: 2 (по умолчанию 2, если не поправлено)",
+        "apply": _apply_gruzchiki_chasov, "columns": ["Тариф_JSON"],
     },
     "kom_avto": {
         "label": "Ком. авто", "hint": "10% или 500, или 1000/400 - ступенчато по часам",
@@ -967,7 +1058,7 @@ _EDIT_MENU_ROWS = [
     ["avto_baza", "avto_dop_chas", "min_chasov"],
     ["km", "dop_tochka", "gidrobort"],
     ["kom_avto", "kom_gruzchiki"],
-    ["gruzchiki_baza", "gruzchiki_dop_chas"],
+    ["gruzchiki_baza", "gruzchiki_dop_chas", "gruzchiki_chasov"],
     ["etazhi", "prohody", "ves"],
     ["platelshik", "forma_oplaty"],
 ]
@@ -975,7 +1066,7 @@ _EDIT_MENU_ROWS = [
 _EDIT_MENU_LABELS = {
     "avto_baza": "🚘 Авто",
     "avto_dop_chas": "🚘 Доп час",
-    "min_chasov": "🚘 Мин. часов",
+    "min_chasov": "🚘 Часы",
     "km": "🚘 Км",
     "dop_tochka": "🚘 Точка",
     "gidrobort": "🚘 ГБ",
@@ -983,6 +1074,7 @@ _EDIT_MENU_LABELS = {
     "kom_gruzchiki": "🏋️\u200d♀️ Ком грузчики",
     "gruzchiki_baza": "🏋️\u200d♀️ Грузчики",
     "gruzchiki_dop_chas": "🏋️\u200d♀️ Доп час",
+    "gruzchiki_chasov": "🏋️\u200d♀️ Часы",
     "etazhi": "🏋️\u200d♀️ Этаж",
     "prohody": "🏋️\u200d♀️ Проход",
     "ves": "🏋️\u200d♀️ Вес",
@@ -1113,6 +1205,43 @@ async def handle_tariff_callback(update: Update, context: ContextTypes.DEFAULT_T
     elif action == "editfield":
         field_key, order_key = parts[1], parts[2]
         fdef = FIELD_DEFS[field_key]
+
+        sheet = get_sheet()
+        row_num = find_row_by_key(sheet, order_key)
+        if not row_num:
+            await query.edit_message_text(f"⚠️ Не нашёл строку заказа по ключу {order_key} в таблице.")
+            return
+        pending = get_or_reparse_tariff(sheet, row_num, order_key)
+
+        auto_value = find_pending_neponyatno_value(pending, field_key)
+        if auto_value is not None:
+            # Число уже написано в предупреждении "не понял" - применяем
+            # его сразу к выбранной категории, не переспрашивая логиста.
+            try:
+                fdef["apply"](pending, auto_value)
+            except ValueError as e:
+                await query.edit_message_text(query.message.text + f"\n\n⚠️ {e}")
+                return
+            try:
+                write_tariff_to_sheet(sheet, row_num, pending)
+            except Exception as e:
+                logger.error(f"Не удалось записать авто-резолв поля '{field_key}', key={order_key}: {e}")
+                await query.edit_message_text(f"⚠️ Не удалось записать в таблицу: {e}")
+                return
+            _pending_tariffs[order_key] = pending
+            _order_edited_fields.setdefault(order_key, set()).add(field_key)
+            log_field_correction(order_key, fdef["label"], "(не понял)", auto_value)
+            log_event(f"Правка поля '{fdef['label']}' авто-резолв из 'не понял'", row=row_num)
+
+            author_line = _order_author_line.get(order_key, "")
+            edited = _order_edited_fields.get(order_key, set())
+            await query.edit_message_text(
+                build_tariff_preview(pending, author_line, edited),
+                reply_markup=tariff_level1_keyboard(order_key),
+            )
+            return
+
+        # Обычный флоу - число неизвестно, просим прислать значение.
         _awaiting_field_edit[msg_key] = (order_key, field_key)
         cancel_kb = InlineKeyboardMarkup([[
             InlineKeyboardButton("❌ Отмена", callback_data=f"editback|{order_key}")
