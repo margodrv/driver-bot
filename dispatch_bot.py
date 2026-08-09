@@ -382,6 +382,15 @@ _TARIFF_SYSTEM_PROMPT = """\
      по формату на "Авто_база/Авто_доп_час". Никогда не подставляй тариф
      грузчиков в kom_gruzchiki просто потому что больше некуда - для
      этого есть отдельные поля выше.
+- tip_rascheta определяется КОЛИЧЕСТВОМ чисел в тарифе - строгое правило:
+  - Тариф - ДВА (или больше) числа через "/" (например "4100/900",
+    "5300/900/20") -> tip_rascheta="почасовка", ПЕРВОЕ число это
+    avto_baza, ВТОРОЕ число это avto_dop_chas (третье, если есть -
+    разбирай по правилу ниже про ключевые слова).
+  - Тариф - ОДНО число без "/" -> tip_rascheta="фикс", это число -
+    avto_baza, avto_dop_chas и min_chasov = null.
+  Это правило строгое и не зависит от суммы или контекста - считай
+  количество чисел через "/" в самой тарифной строке, не додумывай.
 - Числа через "/" в начале блока тарифа (например "5300/900/20") - это
   авто_база/авто_доп_час/третье число. Третье число НЕ имеет фиксированного
   смысла само по себе - определяй его назначение ТОЛЬКО по ближайшему
@@ -390,8 +399,6 @@ _TARIFF_SYSTEM_PROMPT = """\
   "прохід"/"проход"/"заносов" -> prohody_stavka; "точка"/"Т3" -> dop_tochka.
   Если рядом с числом нет ни одного из этих триггер-слов - НЕ угадывай его
   назначение, оставь соответствующее поле null и опиши число в neponyatno.
-- Если тариф - одно число без "/" - это tip_rascheta="фикс", avto_baza =
-  это число, avto_dop_chas и min_chasov = null.
 - Гидроборт (gidrobort) заполняй ТОЛЬКО если в тексте явно написано что-то
   вида "гідроборт +950 якщо використовують" - то есть оплата по факту
   использования, а не автоматическая доплата. Если гидроборт просто
@@ -408,6 +415,14 @@ _TARIFF_SYSTEM_PROMPT = """\
   "безнал"/"на карту"/"БН" и т.п.
 - Если поле явно не упомянуто в тексте - null, не додумывай значение по
   умолчанию.
+
+Примеры (только фрагмент про тариф, не весь текст заявки):
+
+Вход: "Тариф: 4100/900\nКом 450"
+Выход (фрагмент): "avto_baza": 4100, "avto_dop_chas": 900, "tip_rascheta": "почасовка", "kom_avto": {"znachenie": 450, "tip": "сумма"}
+
+Вход: "Тариф 2500\nКом 10%"
+Выход (фрагмент): "avto_baza": 2500, "avto_dop_chas": null, "tip_rascheta": "фикс", "kom_avto": {"znachenie": 10, "tip": "%"}
 """
 
 
@@ -466,19 +481,19 @@ def build_tariff_preview(tariff: dict, author_line: str = "", edited_fields: set
 
     base = tariff.get("avto_baza")
     if tariff.get("tip_rascheta") == "фикс":
-        lines.append(f"Авто: {_fmt_num(base)} (фикса){star(['avto', 'tip_rascheta', 'min_chasov'])}")
+        lines.append(f"Авто: {_fmt_num(base)} (фикса){star(['avto_baza', 'avto_dop_chas', 'min_chasov'])}")
     elif base is not None:
         min_h = tariff.get("min_chasov")
         dop = _fmt_num(tariff.get("avto_dop_chas"))
         hours_part = f" ({_fmt_num(min_h)}ч)" if min_h is not None else ""
-        lines.append(f"Авто: {_fmt_num(base)}{hours_part}/{dop}{star(['avto', 'tip_rascheta', 'min_chasov'])}")
+        lines.append(f"Авто: {_fmt_num(base)}{hours_part}/{dop}{star(['avto_baza', 'avto_dop_chas', 'min_chasov'])}")
 
     gr_base = tariff.get("gruzchiki_baza")
     if gr_base is not None:
         gr_dop = _fmt_num(tariff.get("gruzchiki_dop_chas"))
         # Грузчики всегда на 2ч по подтверждённому бизнес-правилу - это
         # константа, не значение из текста заявки или GPT.
-        lines.append(f"Грузчики: {_fmt_num(gr_base)} (2ч)/{gr_dop}{star(['gruzchiki'])}")
+        lines.append(f"Грузчики: {_fmt_num(gr_base)} (2ч)/{gr_dop}{star(['gruzchiki_baza', 'gruzchiki_dop_chas'])}")
 
     kom_avto = tariff.get("kom_avto")
     kom_gruz = tariff.get("kom_gruzchiki")
@@ -600,15 +615,6 @@ def _parse_platelshik(text: str):
     raise ValueError("напишите 'Клиент' или 'Диспетчер'")
 
 
-def _parse_tip_rascheta(text: str):
-    t = text.strip().lower()
-    if "фикс" in t or "фікс" in t:
-        return "фикс"
-    if "почас" in t:
-        return "почасовка"
-    raise ValueError("напишите 'фикс' или 'почасовка'")
-
-
 def _parse_forma_oplaty(text: str):
     t = text.strip().lower()
     if t in ("нал", "готівка", "готовка", "cash"):
@@ -618,25 +624,39 @@ def _parse_forma_oplaty(text: str):
     raise ValueError("напишите 'Нал' или 'БН'")
 
 
-def _apply_avto(tariff, text):
-    t = text.strip()
-    if "/" in t:
-        a, b = _parse_two_numbers(t)
-        tariff["avto_baza"], tariff["avto_dop_chas"] = a, b
-        tariff["tip_rascheta"] = "почасовка"
-    else:
-        tariff["avto_baza"] = _parse_one_number(t)
-        tariff["avto_dop_chas"] = None
-        tariff["tip_rascheta"] = "фикс"
+def _recompute_tip_rascheta(tariff):
+    """Тип расчёта всегда выводится из наличия доп.часа авто - отдельной
+    ручной кнопки для него больше нет, чтобы значение не могло разойтись
+    с фактическими цифрами (баг 09.08: правка одного числа без второго
+    случайно превращала почасовку в фикс)."""
+    tariff["tip_rascheta"] = "почасовка" if tariff.get("avto_dop_chas") is not None else "фикс"
+
+
+_EMPTY_VALUES = {"", "-", "0", "нет", "немає", "net"}
+
+
+def _apply_avto_baza(tariff, text):
+    tariff["avto_baza"] = _parse_one_number(text)
+    _recompute_tip_rascheta(tariff)
+
+
+def _apply_avto_dop_chas(tariff, text):
+    t = text.strip().lower()
+    tariff["avto_dop_chas"] = None if t in _EMPTY_VALUES else _parse_one_number(text)
+    _recompute_tip_rascheta(tariff)
 
 
 def _apply_min_chasov(tariff, text):
     tariff["min_chasov"] = _parse_one_number(text)
 
 
-def _apply_gruzchiki(tariff, text):
-    a, b = _parse_two_numbers(text)
-    tariff["gruzchiki_baza"], tariff["gruzchiki_dop_chas"] = a, b
+def _apply_gruzchiki_baza(tariff, text):
+    tariff["gruzchiki_baza"] = _parse_one_number(text)
+
+
+def _apply_gruzchiki_dop_chas(tariff, text):
+    t = text.strip().lower()
+    tariff["gruzchiki_dop_chas"] = None if t in _EMPTY_VALUES else _parse_one_number(text)
 
 
 def _apply_kom_avto(tariff, text):
@@ -651,27 +671,34 @@ def _apply_platelshik(tariff, text):
     tariff["platelshik"] = _parse_platelshik(text)
 
 
-def _apply_tip_rascheta(tariff, text):
-    tariff["tip_rascheta"] = _parse_tip_rascheta(text)
-
-
 def _apply_forma_oplaty(tariff, text):
     tariff["forma_oplaty"] = _parse_forma_oplaty(text)
 
 
 # field_key -> {label, hint, apply(tariff, text), columns затрагиваемые в Sheets}
+# Каждое поле правится НЕЗАВИСИМО одним числом - никаких "два числа через
+# /" в одном вводе, чтобы нельзя было случайно стереть соседнее значение,
+# затронув только одну часть тарифа.
 FIELD_DEFS = {
-    "avto": {
-        "label": "Авто (база/доп.час)", "hint": "4750/950 - почасовка, или просто 1890 - фикс",
-        "apply": _apply_avto, "columns": ["Авто_база", "Авто_доп_час", "Тип_расчёта"],
+    "avto_baza": {
+        "label": "Авто база", "hint": "например: 4100",
+        "apply": _apply_avto_baza, "columns": ["Авто_база", "Тип_расчёта"],
+    },
+    "avto_dop_chas": {
+        "label": "Авто доп.час", "hint": "например: 900 (или '-' если фикс без доп.часа)",
+        "apply": _apply_avto_dop_chas, "columns": ["Авто_доп_час", "Тип_расчёта"],
     },
     "min_chasov": {
         "label": "Мин. часов", "hint": "например: 3",
         "apply": _apply_min_chasov, "columns": ["Мин_часов"],
     },
-    "gruzchiki": {
-        "label": "Грузчики (база/доп.час)", "hint": "например: 2400/1200",
-        "apply": _apply_gruzchiki, "columns": ["Грузчики_база", "Грузчики_доп_час"],
+    "gruzchiki_baza": {
+        "label": "Грузчики база", "hint": "например: 2400",
+        "apply": _apply_gruzchiki_baza, "columns": ["Грузчики_база"],
+    },
+    "gruzchiki_dop_chas": {
+        "label": "Грузчики доп.час", "hint": "например: 1200",
+        "apply": _apply_gruzchiki_dop_chas, "columns": ["Грузчики_доп_час"],
     },
     "kom_avto": {
         "label": "Ком. авто", "hint": "например: 10% или 500",
@@ -684,10 +711,6 @@ FIELD_DEFS = {
     "platelshik": {
         "label": "Плательщик", "hint": "Клиент или Диспетчер",
         "apply": _apply_platelshik, "columns": ["Плательщик"],
-    },
-    "tip_rascheta": {
-        "label": "Тип расчёта", "hint": "фикс или почасовка",
-        "apply": _apply_tip_rascheta, "columns": ["Тип_расчёта"],
     },
     "forma_oplaty": {
         "label": "Форма оплаты", "hint": "Нал или БН",
