@@ -661,7 +661,9 @@ _RE_VES_DOPY = re.compile(r"прохід\s*\d+\s*м\s*/\s*поверх\s*з\s*в
 _RE_KOM_PERCENT = re.compile(r"ком\s*(\d+(?:[.,]\d+)?)\s*%", re.IGNORECASE)
 
 
-_RE_ROKLA_GENERAL = re.compile(r"рокла\s*(\d+(?:[.,]\d+)?)", re.IGNORECASE)
+_RE_ROKLA_GENERAL = re.compile(
+    r"(?:рокла\s*(\d+(?:[.,]\d+)?))|(?:(\d+(?:[.,]\d+)?)\s*рокла)", re.IGNORECASE
+)
 _RE_KM_GENERAL = re.compile(r"(\d+(?:[.,]\d+)?)\s*грн\s*/\s*км", re.IGNORECASE)
 
 
@@ -688,7 +690,7 @@ def _apply_keyword_overrides(result: dict, order_text: str):
 
     m = _RE_ROKLA_GENERAL.search(order_text or "")
     if m:
-        val = float(m.group(1).replace(",", "."))
+        val = float((m.group(1) or m.group(2)).replace(",", "."))
         prochie = [d for d in (tj.get("prochie_dopy") or []) if (d.get("nazvanie") or "").strip().lower() != "рокла"]
         prochie.append({"nazvanie": "Рокла", "summa": val, "group": "avto"})
         tj["prochie_dopy"] = prochie
@@ -1183,7 +1185,9 @@ def _format_avto_extra_lines(tj: dict, star) -> list:
             continue
         summa = dop.get("summa")
         summa_str = f"{_fmt_num(summa)} грн" if summa is not None else "по факту"
-        lines.append(f"{dop.get('nazvanie', 'Доп')}: {summa_str}")
+        nazvanie = dop.get("nazvanie", "Доп")
+        dop_star = star(["rokla"]) if nazvanie.strip().lower() == "рокла" else ""
+        lines.append(f"{nazvanie}: {summa_str}{dop_star}")
 
     return lines
 
@@ -1478,6 +1482,16 @@ def _apply_ves(tariff, text):
     _resolve_neponyatno(tariff)
 
 
+def _apply_rokla(tariff, text):
+    t = text.strip().lower()
+    tj = tariff.setdefault("tariff_json", {})
+    prochie = [d for d in (tj.get("prochie_dopy") or []) if (d.get("nazvanie") or "").strip().lower() != "рокла"]
+    if t not in _EMPTY_VALUES:
+        prochie.append({"nazvanie": "Рокла", "summa": _parse_one_number(text), "group": "avto"})
+    tj["prochie_dopy"] = prochie
+    _resolve_neponyatno(tariff)
+
+
 # field_key -> {label, hint, apply(tariff, text), columns затрагиваемые в Sheets}
 # Каждое поле правится НЕЗАВИСИМО одним числом - никаких "два числа через
 # /" в одном вводе, чтобы нельзя было случайно стереть соседнее значение,
@@ -1506,6 +1520,10 @@ FIELD_DEFS = {
     "gruzchiki_chasov": {
         "label": "Часы (грузчики)", "hint": "например: 2 (по умолчанию 2, если не поправлено)",
         "apply": _apply_gruzchiki_chasov, "columns": ["Тариф_JSON"],
+    },
+    "rokla": {
+        "label": "Рокла", "hint": "например: 400 (или '-' чтобы убрать)",
+        "apply": _apply_rokla, "columns": ["Тариф_JSON"],
     },
     "kom_avto": {
         "label": "Ком. авто", "hint": "10% или 500, или 1000/400 - ступенчато по часам",
@@ -1586,7 +1604,7 @@ def tariff_level1_keyboard(order_key: str) -> InlineKeyboardMarkup:
 _EDIT_MENU_ROWS = [
     ["avto_baza", "avto_dop_chas", "min_chasov"],
     ["km", "dop_tochka", "gidrobort"],
-    ["kom_avto", "kom_gruzchiki"],
+    ["rokla", "kom_avto", "kom_gruzchiki"],
     ["gruzchiki_baza", "gruzchiki_dop_chas", "gruzchiki_chasov"],
     ["etazhi", "prohody", "ves"],
     ["platelshik", "forma_oplaty"],
@@ -1599,6 +1617,7 @@ _EDIT_MENU_LABELS = {
     "km": "🚘 Км",
     "dop_tochka": "🚘 Точка",
     "gidrobort": "🚘 ГБ",
+    "rokla": "🚘 Рокла",
     "kom_avto": "🚘 Ком авто",
     "kom_gruzchiki": "🏋️\u200d♀️ Ком грузчики",
     "gruzchiki_baza": "🏋️\u200d♀️ Грузчики",
