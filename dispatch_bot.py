@@ -929,6 +929,75 @@ def _strip_bogus_kom(result: dict, order_text: str):
     result["neponyatno"] = neponyatno
 
 
+def _is_plausible_gidrobort(v) -> bool:
+    return 200 <= v <= 800 and v % 50 == 0
+
+
+def _strip_implausible_dop_tochka(result: dict):
+    """Подтверждено: доп.точка всегда 150/200/250/300.../700 и т.д. (от
+    150, кратно 50) - никогда не бывает мелких чисел вроде 44. Реальный
+    кейс (15.08): "Тар авто 1300/400/44" - GPT засунул "44" в доп.точку
+    по умолчанию (нет триггер-слова рядом), хотя это явно км (маленькое
+    число, похоже на ставку за километр). Если значение не проходит по
+    правдоподобному диапазону - убираем из dop_tochka, переносим в
+    neponyatno с акцентом на "км?" как более вероятный кандидат.
+    "ГБ?" предлагаем кандидатом только если число вообще попадает в
+    правдоподобный диапазон ГБ (200-800, кратно 50) - иначе не путаем
+    логиста заведомо неподходящим вариантом.
+    """
+    tj = result.get("tariff_json") or {}
+    dt = tj.get("dop_tochka")
+    if not dt or dt.get("summa") is None:
+        return
+    v = dt["summa"]
+    if v < 150 or v % 50 != 0:
+        tj["dop_tochka"] = None
+        candidates = ["км?"]
+        if _is_plausible_gidrobort(v):
+            candidates.append("ГБ?")
+        neponyatno = list(result.get("neponyatno") or [])
+        neponyatno.append(f"{_fmt_num(v)}: " + "/".join(candidates))
+        result["neponyatno"] = neponyatno
+
+
+def _strip_implausible_gidrobort(result: dict):
+    """Симметрично доп.точке: ГБ всегда 200/250/300.../800 (кратно 50) -
+    никогда не бывает мелких чисел. Если GPT поставил в гідроборт число
+    вне диапазона - убираем, переносим в neponyatno."""
+    tj = result.get("tariff_json") or {}
+    gb = tj.get("gidrobort")
+    if not gb or gb.get("summa") is None:
+        return
+    v = gb["summa"]
+    if not _is_plausible_gidrobort(v):
+        tj["gidrobort"] = None
+        candidates = ["км?"]
+        if v >= 150 and v % 50 == 0:
+            candidates.append("точка?")
+        neponyatno = list(result.get("neponyatno") or [])
+        neponyatno.append(f"{_fmt_num(v)}: " + "/".join(candidates))
+        result["neponyatno"] = neponyatno
+
+
+_FORMA_NAL_RE = re.compile(r"нал|готів", re.IGNORECASE)
+_FORMA_BN_RE = re.compile(r"без\s*нал|\bб\s*/?\s*н\b", re.IGNORECASE)
+
+
+def _normalize_forma_oplaty(result: dict):
+    """Унифицируем формулировку формы оплаты - GPT иногда возвращает
+    сырую фразу из текста целиком (например "готівкою або на карту")
+    вместо строгого 'Нал'/'БН'. Подтверждено: любая формулировка с
+    "нал"/"готівка" (даже вперемешку с упоминанием карты) - это "Нал".
+    Явное "безнал"/"БН" - это "БН". Всё остальное не трогаем."""
+    fo = result.get("forma_oplaty")
+    if not fo:
+        return
+    if _FORMA_BN_RE.search(fo):
+        result["forma_oplaty"] = "БН"
+    elif _FORMA_NAL_RE.search(fo):
+        result["forma_oplaty"] = "Нал"
+
+
 def _strip_bogus_gidrobort(result: dict):
     """Упоминание 'гідроборт' как характеристики авто (например '5т
     гідроборт + 2 вантажника') НЕ означает отдельную доплату - по
@@ -1064,6 +1133,9 @@ def parse_tariff_via_gpt(order_text: str) -> dict:
         _strip_bogus_kom(result, order_text)
         result["neponyatno"] = _filter_neponyatno(result)
         _strip_bogus_gidrobort(result)
+        _strip_implausible_dop_tochka(result)
+        _strip_implausible_gidrobort(result)
+        _normalize_forma_oplaty(result)
         _reconcile_neponyatno(result)
         return result
     except Exception as e:
@@ -1447,13 +1519,18 @@ def _apply_gidrobort(tariff, text):
     v = _parse_one_number(text)
     if v == 0:
         raise ValueError("0 не похоже на доплату 'по факту' - если доплаты нет, оставьте пустым ('-')")
+    if v < 200 or v > 800 or v % 50 != 0:
+        raise ValueError(f"{_fmt_num(v)} не похоже на ГБ (обычно 200/250/300.../800, кратно 50) - проверьте цифру, возможно это км/доп.точка")
     tj["gidrobort"] = {"summa": v, "po_faktu": True}
     _resolve_neponyatno(tariff)
 
 
 def _apply_dop_tochka(tariff, text):
+    v = _parse_one_number(text)
+    if v < 150 or v % 50 != 0:
+        raise ValueError(f"{_fmt_num(v)} не похоже на доп.точку (обычно 150/200/250.../700 и т.д., кратно 50) - проверьте цифру, возможно это км")
     tj = tariff.setdefault("tariff_json", {})
-    tj["dop_tochka"] = {"tip": "doplata_fix", "summa": _parse_one_number(text)}
+    tj["dop_tochka"] = {"tip": "doplata_fix", "summa": v}
     _resolve_neponyatno(tariff)
 
 
