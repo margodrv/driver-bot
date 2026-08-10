@@ -700,6 +700,14 @@ def _apply_keyword_overrides(result: dict, order_text: str):
             tj["dop_tochka"] = None
         if (tj.get("dop_hodka") or {}).get("summa") == val:
             tj["dop_hodka"] = None
+    elif re.search(r"рокла", order_text or "", re.IGNORECASE):
+        # Слово "рокла" упомянуто (обычно как характеристика авто, típа
+        # "5Т+ГБ+Рокла"), но БЕЗ отдельной цены рядом - подтверждено:
+        # значит рокла уже включена в тариф, отдельно не доплачивают
+        # (тот же принцип, что и с гідробортом без суммы "по факту").
+        # Убираем любую ошибочно насочинённую GPT запись "Рокла".
+        prochie = [d for d in (tj.get("prochie_dopy") or []) if (d.get("nazvanie") or "").strip().lower() != "рокла"]
+        tj["prochie_dopy"] = prochie
 
     m = _RE_KM_GENERAL.search(order_text or "")
     if m:
