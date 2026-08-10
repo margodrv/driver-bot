@@ -365,7 +365,7 @@ _TARIFF_SYSTEM_PROMPT = """\
     "ves": {"tip": "ploskaya", "stavka": число} или {"tip": "porogovaya", "porogi": [{"ot": число, "stavka": число}]} или null,
     "etazhi_stavka": число или null,
     "prohody_stavka": число или null,
-    "prochie_dopy": [{"nazvanie": строка, "summa": число}] или []
+    "prochie_dopy": [{"nazvanie": строка, "summa": число, "group": "avto"|"gruzchiki"}] или []
   },
   "neponyatno": [КОРОТКАЯ строка вида "<число>: вариант1?/вариант2?"
     - только про цифры/условия оплаты в САМОМ ТАРИФЕ, никогда про
@@ -461,6 +461,28 @@ _TARIFF_SYSTEM_PROMPT = """\
   водитель, но не логист заранее) - НЕ помечай её в neponyatno (это не
   ошибка распознавания), просто занеси в prochie_dopy с summa=null и
   названием, отражающим что это "по факту, от X грн".
+- Каждый элемент prochie_dopy ОБЯЗАТЕЛЬНО должен иметь "group": "avto"
+  (доплата, относится к машине/маршруту - например "рокла" - тележка/
+  оборудование, "заміський" - выезд за город, любые именные допы к
+  авто) или "gruzchiki" (доплата, относится к работе грузчиков - любые
+  именные допы, завязанные на переноску/вес/этажи). Если сомневаешься -
+  используй "avto".
+- "км"/"кілометр" рядом с числом - это ВСЕГДА km_stavka, даже если
+  формат похож на "доп.точку" (например "+заміський 90грн/км" ->
+  km_stavka=90, а НЕ dop_tochka - слово "км" однозначно указывает на
+  километраж, приоритет у него выше любых догадок по формату числа).
+- "рокла" (тележка/подъёмное оборудование) рядом с числом - это НЕ
+  доп.ходка (доп.ходка - это про повторный заезд, а не оборудование) -
+  заноси в prochie_dopy с nazvanie "Рокла", group "avto".
+- Если число сопровождается "м"/"метр" (единица РАССТОЯНИЯ, не грн) -
+  это НЕ цена, не заполняй etazhi_stavka/prohody_stavka из него - это
+  просто описание расстояния/ширины прохода, денежного значения тут нет.
+  Ищи РЯДОМ отдельное число именно в грн - это и есть настоящая ставка.
+- "з вагою по X грн на людину" (доплата, СВЯЗАННАЯ с весом груза, но не
+  сама ставка веса) - это отдельная именная допа: prochie_dopy с
+  nazvanie "Допы с весом", summa=X, group "gruzchiki". НЕ путай с самим
+  полем "ves" (ves - это ставка за кг, например "від 160кг по 8грн/кг" -
+  разные вещи, могут встречаться в одном заказе одновременно).
 - Комиссия может состоять из нескольких чисел (например "900/100/8" -
   база/точка/км) - раскладывай так же по ключевым словам рядом, аналогично
   правилу выше.
@@ -908,7 +930,10 @@ def build_tariff_preview(tariff: dict, author_line: str = "", edited_fields: set
     lines.append("📋 Тариф по заказу")
 
     star = lambda keys: " ⭐️" if edited_fields & set(keys) else ""
+    tj = tariff.get("tariff_json") or {}
 
+    # --- Блок "Авто": сама ставка + все доп.начисления, привязанные к
+    # авто (доп.точка/гідроборт/доп.ходка/км/именные допы группы avto) ---
     base = tariff.get("avto_baza")
     if tariff.get("tip_rascheta") == "фикс":
         lines.append(f"Авто: {_fmt_num(base)} (фикса){star(['avto_baza', 'avto_dop_chas', 'min_chasov'])}")
@@ -918,13 +943,17 @@ def build_tariff_preview(tariff: dict, author_line: str = "", edited_fields: set
         hours_part = f" ({_fmt_num(min_h)}ч)" if min_h is not None else ""
         lines.append(f"Авто: {_fmt_num(base)}{hours_part}/{dop}{star(['avto_baza', 'avto_dop_chas', 'min_chasov'])}")
 
-    dt = (tariff.get("tariff_json") or {}).get("dop_tochka")
+    dt = tj.get("dop_tochka")
     if dt:
         if dt.get("tip") == "pereschet_minimalki":
             lines.append(f"Доп.точка: новый минимум {_fmt_num(dt.get('summa'))} грн{star(['dop_tochka'])}")
         else:
             lines.append(f"Доп.точка: +{_fmt_num(dt.get('summa'))} грн{star(['dop_tochka'])}")
 
+    lines.extend(_format_avto_extra_lines(tj, star))
+
+    # --- Блок "Грузчики": сама ставка + всё, что привязано к грузчикам
+    # (вес/этажи/проходы/именные допы группы gruzchiki) ---
     gr_base = tariff.get("gruzchiki_baza")
     if gr_base is not None:
         gr_dop = _fmt_num(tariff.get("gruzchiki_dop_chas"))
@@ -940,6 +969,9 @@ def build_tariff_preview(tariff: dict, author_line: str = "", edited_fields: set
             gr_line += "/" + "/".join(_fmt_num(n) for n in gr_extra)
         lines.append(gr_line + star(["gruzchiki_baza", "gruzchiki_dop_chas", "gruzchiki_dopy", "gruzchiki_chasov"]))
 
+    lines.extend(_format_gruzchiki_extra_lines(tj, star))
+
+    # --- Комиссия, плательщик, форма оплаты - в конце ---
     kom_avto = tariff.get("kom_avto")
     kom_gruz = tariff.get("kom_gruzchiki")
 
@@ -969,20 +1001,16 @@ def build_tariff_preview(tariff: dict, author_line: str = "", edited_fields: set
     else:
         lines.append("⚠️ Форма оплаты: не указана")
 
-    lines.extend(_format_tariff_json_lines(tariff.get("tariff_json") or {}, edited_fields))
-
     for item in tariff.get("neponyatno") or []:
         lines.append(f"⚠️ не понял: {item}")
 
     return "\n".join(lines)
 
 
-def _format_tariff_json_lines(tj: dict, edited_fields: set = frozenset()) -> list:
-    """Раньше эти поля писались в Тариф_JSON, но нигде не показывались в
-    превью - логист не видел, например, что доп.точка распознана. Теперь
-    показываем компактной строкой всё, что реально заполнено."""
+def _format_avto_extra_lines(tj: dict, star) -> list:
+    """Доп.начисления, которые ВСЕГДА относятся к авто (не к грузчикам):
+    гідроборт, доп.ходка, км, плюс именные допы с group='avto'."""
     lines = []
-    star = lambda keys: " ⭐️" if edited_fields & set(keys) else ""
 
     gb = tj.get("gidrobort")
     if gb and gb.get("summa"):
@@ -999,6 +1027,21 @@ def _format_tariff_json_lines(tj: dict, edited_fields: set = frozenset()) -> lis
 
     if tj.get("km_stavka") is not None:
         lines.append(f"Км: {_fmt_num(tj['km_stavka'])} грн/км{star(['km'])}")
+
+    for dop in tj.get("prochie_dopy") or []:
+        if (dop.get("group") or "avto") != "avto":
+            continue
+        summa = dop.get("summa")
+        summa_str = f"{_fmt_num(summa)} грн" if summa is not None else "по факту"
+        lines.append(f"{dop.get('nazvanie', 'Доп')}: {summa_str}")
+
+    return lines
+
+
+def _format_gruzchiki_extra_lines(tj: dict, star) -> list:
+    """Доп.начисления, которые ВСЕГДА относятся к грузчикам: вес, этажи,
+    проходы, плюс именные допы с group='gruzchiki'."""
+    lines = []
 
     ves = tj.get("ves")
     if ves:
@@ -1022,6 +1065,8 @@ def _format_tariff_json_lines(tj: dict, edited_fields: set = frozenset()) -> lis
         lines.append(f"Проходы: {_fmt_num(tj['prohody_stavka'])} грн{star(['prohody'])}")
 
     for dop in tj.get("prochie_dopy") or []:
+        if dop.get("group") != "gruzchiki":
+            continue
         summa = dop.get("summa")
         summa_str = f"{_fmt_num(summa)} грн" if summa is not None else "по факту"
         lines.append(f"{dop.get('nazvanie', 'Доп')}: {summa_str}")
