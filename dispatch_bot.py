@@ -435,6 +435,18 @@ _TARIFF_SYSTEM_PROMPT = """\
   Пример: "Тар 6000/1200/600" без слов рядом с "600" -> avto_baza=6000,
   avto_dop_chas=1200, neponyatno=["600: ГБ?/точка?/км?"] (без "этаж?"/
   "проход?" - 600 слишком много для них).
+- КРИТИЧНО: если в тарифной строке АВТО (не отдельной строке
+  "вантажники") больше 2 чисел через "/" (например "2100/600/200/1000/44"
+  - это тариф авто с несколькими доп.числами, а НЕ "тариф авто + тариф
+  грузчиков"! НИКОГДА не заполняй gruzchiki_baza/gruzchiki_dop_chas
+  просто потому что чисел много - эти поля заполняются ТОЛЬКО если в
+  тексте ЕСТЬ отдельное слово "вантажники"/"грузчики" с СОБСТВЕННЫМИ
+  числами рядом с этим словом. Если такого слова в тексте вообще нет -
+  gruzchiki_baza/gruzchiki_dop_chas/gruzchiki_dopy остаются null/[] всегда,
+  сколько бы чисел ни было в тарифе авто. Каждое доп.число классифицируй
+  по своему ключевому слову рядом (как в правиле выше) или в neponyatno.
+  "Сан. обробка"/"санобробка"/"санітарна обробка" рядом с числом -> клади
+  в prochie_dopy с nazvanie "Санобробка".
 - Гидроборт (gidrobort) заполняй ТОЛЬКО если в тексте явно написано число
   рядом со словом "гідроборт", означающее доплату (например "гідроборт
   +950 якщо використовують"). ПОДТВЕРЖДЕНО: если "гідроборт" упомянут
@@ -549,6 +561,45 @@ def find_pending_neponyatno_value(tariff: dict, field_key: str):
         if label in cands:
             return num_str
     return None
+
+
+_LOADER_TEXT_RE = re.compile(r"вантаж|грузчик", re.IGNORECASE)
+
+
+def _strip_bogus_gruzchiki(result: dict, order_text: str):
+    """КРИТИЧНАЯ защита: если в самом тексте заявки нет ни слова
+    'вантажник', ни 'грузчик' - в заказе НЕТ грузчиков, точка. Обнаружен
+    реальный случай (10.08): заказ "3т + ГБ" без единого упоминания
+    грузчиков, а GPT всё равно сочинил gruzchiki_baza/gruzchiki_dop_chas
+    из лишних чисел строки тарифа АВТО (позиционная путаница - решил,
+    что 3-е/4-е/5-е числа это отдельный блок вантажников, хотя это
+    просто хвост тарифа авто без явного назначения).
+
+    Форсируем очистку кодом, а не полагаемся на промпт - но числа не
+    теряем: переносим их в neponyatno, чтобы логист мог сам разобрать
+    через кнопки (Точка/Км/ГБ и т.п.), а не остаться с придуманной
+    строкой "Грузчики" в заказе, где грузчиков вообще не было.
+    """
+    if _LOADER_TEXT_RE.search(order_text or ""):
+        return  # текст явно упоминает грузчиков - ничего не трогаем
+
+    stray = []
+    if result.get("gruzchiki_baza") is not None:
+        stray.append(result["gruzchiki_baza"])
+    if result.get("gruzchiki_dop_chas") is not None:
+        stray.append(result["gruzchiki_dop_chas"])
+    stray.extend(result.get("gruzchiki_dopy") or [])
+    if not stray:
+        return  # GPT и так не заполнял - нечего чистить
+
+    result["gruzchiki_baza"] = None
+    result["gruzchiki_dop_chas"] = None
+    result["gruzchiki_dopy"] = []
+
+    neponyatno = list(result.get("neponyatno") or [])
+    for n in stray:
+        neponyatno.append(f"{_fmt_num(n)}: ГБ?/точка?/км?")
+    result["neponyatno"] = neponyatno
 
 
 def _strip_bogus_gidrobort(result: dict):
@@ -675,6 +726,7 @@ def parse_tariff_via_gpt(order_text: str) -> dict:
         raw = completion.choices[0].message.content.strip()
         raw = re.sub(r"^```json\s*|\s*```$", "", raw.strip())
         result = json.loads(raw)
+        _strip_bogus_gruzchiki(result, order_text)
         result["neponyatno"] = _filter_neponyatno(result)
         _strip_bogus_gidrobort(result)
         _reconcile_neponyatno(result)
@@ -980,7 +1032,12 @@ def _apply_min_chasov(tariff, text):
 
 
 def _apply_gruzchiki_baza(tariff, text):
-    tariff["gruzchiki_baza"] = _parse_one_number(text)
+    t = text.strip().lower()
+    # "-" / "0" очищает базу - это единственный способ убрать строку
+    # "Грузчики" целиком, если бот ошибочно её насочинял (см. защиту
+    # _strip_bogus_gruzchiki - но для уже отправленных превью до фикса
+    # нужен ручной способ убрать).
+    tariff["gruzchiki_baza"] = None if t in _EMPTY_VALUES else _parse_one_number(text)
 
 
 def _apply_gruzchiki_dop_chas(tariff, text):
@@ -1249,19 +1306,91 @@ def apply_defaults(sheet, row, tariff: dict) -> dict:
     return tariff
 
 
-def get_or_reparse_tariff(sheet, row_num: int, order_key: str) -> dict:
-    """Возвращает тариф из памяти, а если бот перезапускался и памяти нет -
-    молча пересчитывает его заново из текста заявки в Sheets.
+def read_tariff_from_sheet(sheet, row_num: int):
+    """Восстанавливает тариф из уже записанных значений в 'Orders clean'
+    (а не заново через GPT) - используется, когда логист открывает правку
+    ПОСЛЕ подтверждения. Если бы вместо этого мы заново парсили сырой
+    текст через GPT, все прошлые ручные правки логиста откатились бы к
+    исходному (возможно ошибочному) разбору - это как раз то, что мы
+    хотим избежать.
 
-    Безопасно, потому что GPT вызывается с temperature=0 (детерминированно)
-    и текст заявки в Sheets не меняется между отправкой превью и нажатием
-    кнопки - пересчёт даёт тот же результат, что и первый разбор. Это
-    временная страховка вместо полноценного fallback-опроса: не требует
-    отдельного фонового задания, работает уже сейчас.
+    Возвращает None, если тариф ещё ни разу не подтверждался (колонка
+    Авто_база пуста) - тогда вызывающий код должен разобрать через GPT
+    с нуля, как обычно.
+    """
+    cols = ensure_tariff_columns(sheet)
+    row = sheet.row_values(row_num)
+
+    def cell(name):
+        idx = cols[name]
+        return row[idx - 1] if len(row) >= idx else ""
+
+    avto_baza_raw = cell("Авто_база")
+    if not avto_baza_raw:
+        return None  # ещё не подтверждали - восстанавливать нечего
+
+    def to_num(s):
+        s = (s or "").strip()
+        if not s:
+            return None
+        try:
+            return float(s.replace(",", "."))
+        except ValueError:
+            return None
+
+    tj_raw = cell("Тариф_JSON")
+    try:
+        tj = json.loads(tj_raw) if tj_raw else {}
+    except (json.JSONDecodeError, TypeError):
+        tj = {}
+
+    gruzchiki_dopy = tj.pop("gruzchiki_dopy", [])
+    gruzchiki_chasov = tj.pop("gruzchiki_chasov", None)
+
+    def parse_kom_cell(s):
+        s = (s or "").strip()
+        if not s:
+            return None
+        try:
+            return _parse_kom(s)
+        except ValueError:
+            return None
+
+    return {
+        "avto_baza": to_num(avto_baza_raw),
+        "min_chasov": to_num(cell("Мин_часов")),
+        "avto_dop_chas": to_num(cell("Авто_доп_час")),
+        "gruzchiki_baza": to_num(cell("Грузчики_база")),
+        "gruzchiki_dop_chas": to_num(cell("Грузчики_доп_час")),
+        "gruzchiki_dopy": gruzchiki_dopy,
+        "gruzchiki_chasov": gruzchiki_chasov,
+        "tip_rascheta": cell("Тип_расчёта") or "почасовка",
+        "kom_avto": parse_kom_cell(cell("Ком_авто")),
+        "kom_gruzchiki": parse_kom_cell(cell("Ком_грузчики")),
+        "platelshik": cell("Плательщик") or None,
+        "forma_oplaty": cell("Форма_оплаты") or None,
+        "tariff_json": tj,
+        "neponyatno": [],
+    }
+
+
+def get_or_reparse_tariff(sheet, row_num: int, order_key: str) -> dict:
+    """Возвращает тариф из памяти. Если памяти нет (рестарт бота, или
+    логист открыл правку заново уже ПОСЛЕ подтверждения) - сначала
+    пробует восстановить уже записанные в Sheets значения
+    (read_tariff_from_sheet), сохраняя все прошлые ручные правки. Только
+    если тариф вообще ни разу не подтверждался - разбирает текст через
+    GPT с нуля, как при первом превью.
     """
     pending = _pending_tariffs.get(order_key)
     if pending:
         return pending
+
+    from_sheet = read_tariff_from_sheet(sheet, row_num)
+    if from_sheet is not None:
+        logger.info(f"Тариф для key={order_key} восстановлен из уже записанных данных в Sheets")
+        _pending_tariffs[order_key] = from_sheet
+        return from_sheet
 
     logger.warning(f"Тариф для key={order_key} не найден в памяти (рестарт?) - пересчитываю заново")
     log_event("Тариф: не найден в памяти, пересчитан заново после рестарта", row=row_num)
@@ -1303,11 +1432,22 @@ async def handle_tariff_callback(update: Update, context: ContextTypes.DEFAULT_T
             log_event(f"Тариф: ОШИБКА записи - {e}", row=row_num)
             await query.edit_message_text(f"⚠️ Не удалось записать тариф в таблицу: {e}")
             return
-        _pending_tariffs.pop(order_key, None)
-        _order_author_line.pop(order_key, None)
-        _order_edited_fields.pop(order_key, None)
+        # Не стираем _order_author_line/_order_edited_fields - если логист
+        # откроет правку заново уже после подтверждения, тег автора и
+        # история звёздочек должны сохраниться. _pending_tariffs можно не
+        # трогать - при следующем обращении get_or_reparse_tariff всё
+        # равно подтянет актуальные данные из Sheets (read_tariff_from_sheet).
         log_event("Тариф подтверждён и записан", row=row_num)
-        await query.edit_message_text(query.message.text + "\n\n✅ Подтверждено")
+        # "✏️ Исправить" остаётся доступной и после подтверждения - тариф
+        # мог измениться уже после того, как заказ подтвердили (см. кейс
+        # 10.08: тариф поменялся, а кнопки пропали и поправить было
+        # нельзя).
+        await query.edit_message_text(
+            query.message.text + "\n\n✅ Подтверждено",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("✏️ Исправить", callback_data=f"tariff_editmenu|{order_key}")
+            ]]),
+        )
 
     elif action == "tariff_editmenu":
         order_key = parts[1]
