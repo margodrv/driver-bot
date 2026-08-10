@@ -661,6 +661,52 @@ _RE_VES_DOPY = re.compile(r"прохід\s*\d+\s*м\s*/\s*поверх\s*з\s*в
 _RE_KOM_PERCENT = re.compile(r"ком\s*(\d+(?:[.,]\d+)?)\s*%", re.IGNORECASE)
 
 
+_RE_ROKLA_GENERAL = re.compile(r"рокла\s*(\d+(?:[.,]\d+)?)", re.IGNORECASE)
+_RE_KM_GENERAL = re.compile(r"(\d+(?:[.,]\d+)?)\s*грн\s*/\s*км", re.IGNORECASE)
+
+
+def _apply_keyword_overrides(result: dict, order_text: str):
+    """Общее правило (для ЛЮБОГО заказа, не привязано к конкретному
+    шаблону): если рядом с этими словами в тексте стоит число - оно
+    ВСЕГДА идёт в соответствующую категорию, что бы GPT ни решил.
+
+    Список НАМЕРЕННО короткий - только слова, где сопоставление
+    "слово рядом с числом -> категория" однозначно и без контекстных
+    нюансов:
+    - "рокла" (тележка/оборудование) - всегда именная допа, никогда не
+      доп.ходка/доп.точка
+    - "X грн/км" - всегда километраж, даже если по формату похоже на
+      доп.точку
+
+    "Этаж"/"проход"/"вес"/"санобробка" сюда НЕ включены - у них есть
+    контекстные нюансы (метры vs грн, вес vs допы-с-весом, позиционные
+    случаи вроде "Виталия"), где слепое сопоставление слово->число может
+    навредить больше, чем помочь - для них остаётся комбинация промпта,
+    точечных шаблонов (см. выше) и ручных кнопок правки.
+    """
+    tj = result.setdefault("tariff_json", {})
+
+    m = _RE_ROKLA_GENERAL.search(order_text or "")
+    if m:
+        val = float(m.group(1).replace(",", "."))
+        prochie = [d for d in (tj.get("prochie_dopy") or []) if (d.get("nazvanie") or "").strip().lower() != "рокла"]
+        prochie.append({"nazvanie": "Рокла", "summa": val, "group": "avto"})
+        tj["prochie_dopy"] = prochie
+        # Если это же число ошибочно попало в доп.точку/доп.ходку -
+        # убираем оттуда, "рокла" никогда не то и не другое.
+        if (tj.get("dop_tochka") or {}).get("summa") == val:
+            tj["dop_tochka"] = None
+        if (tj.get("dop_hodka") or {}).get("summa") == val:
+            tj["dop_hodka"] = None
+
+    m = _RE_KM_GENERAL.search(order_text or "")
+    if m:
+        val = float(m.group(1).replace(",", "."))
+        tj["km_stavka"] = val
+        if (tj.get("dop_tochka") or {}).get("summa") == val:
+            tj["dop_tochka"] = None
+
+
 def _apply_avto_gruzchiki_multiline_template(result: dict, order_text: str):
     """Детерминированный разбор для другого повторяющегося многострочного
     шаблона: 'Тар авто X/Yгодини', '.../Наступна година', '+гідроборт',
@@ -917,6 +963,9 @@ def _reconcile_neponyatno(result: dict):
         v = tj.get(key)
         if v is not None:
             used_numbers.add(_fmt_num(v))
+    for dop in tj.get("prochie_dopy") or []:
+        if dop.get("summa") is not None:
+            used_numbers.add(_fmt_num(dop["summa"]))
 
     has_gruzchiki = result.get("gruzchiki_baza") is not None
     gruzchiki_dopy = list(result.get("gruzchiki_dopy") or [])
@@ -999,6 +1048,7 @@ def parse_tariff_via_gpt(order_text: str) -> dict:
         result = json.loads(raw)
         _apply_vitaliya_sanobrobka_template(result, order_text)
         _apply_avto_gruzchiki_multiline_template(result, order_text)
+        _apply_keyword_overrides(result, order_text)
         _recover_avto_dop_chas(result, order_text)
         _strip_bogus_gruzchiki(result, order_text)
         _strip_bogus_kom(result, order_text)
