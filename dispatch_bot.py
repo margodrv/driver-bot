@@ -649,22 +649,22 @@ def _recover_avto_dop_chas(result: dict, order_text: str):
 
 _TEMPLATE_MARKERS = ("тар авто", "наступна година", "гідроборт", "рокла", "заміський", "вантажник", "вагі від", "прохід")
 
-_RE_AVTO_BAZA_HOURS = re.compile(r"тар\s*авто\s*(\d+(?:[.,]\d+)?)\s*грн\s*/\s*(\d+(?:[.,]\d+)?)\s*годин", re.IGNORECASE)
-_RE_AVTO_DOP_CHAS = re.compile(r"(\d+(?:[.,]\d+)?)\s*/\s*наступна\s*година", re.IGNORECASE)
-_RE_GIDROBORT = re.compile(r"гідроборт\s*(\d+(?:[.,]\d+)?)", re.IGNORECASE)
-_RE_ROKLA = re.compile(r"рокла\s*(\d+(?:[.,]\d+)?)", re.IGNORECASE)
-_RE_KM = re.compile(r"заміський\s*(\d+(?:[.,]\d+)?)\s*грн\s*/\s*км", re.IGNORECASE)
-_RE_GRUZCHIKI_HEADER = re.compile(r"тар\s*\d+\s*вантажник\w*\s*(\d+(?:[.,]\d+)?)\s*/\s*(\d+(?:[.,]\d+)?)\s*годин", re.IGNORECASE)
-_RE_GRUZCHIKI_DOP_CHAS = re.compile(r"(\d+(?:[.,]\d+)?)\s*грн\s*/\s*наступна", re.IGNORECASE)
-_RE_VES = re.compile(r"ваг[іи]\s*від\s*(\d+(?:[.,]\d+)?)\s*по\s*(\d+(?:[.,]\d+)?)\s*грн\s*/\s*кг", re.IGNORECASE)
-_RE_VES_DOPY = re.compile(r"прохід\s*\d+\s*м\s*/\s*поверх\s*з\s*вагою\s*по\s*(\d+(?:[.,]\d+)?)\s*грн\s*на\s*людину", re.IGNORECASE)
-_RE_KOM_PERCENT = re.compile(r"ком\s*(\d+(?:[.,]\d+)?)\s*%", re.IGNORECASE)
+_RE_AVTO_BAZA_HOURS = re.compile(r"тар[ \t]*авто[ \t]*(\d+(?:[.,]\d+)?)[ \t]*грн[ \t]*/[ \t]*(\d+(?:[.,]\d+)?)[ \t]*годин", re.IGNORECASE)
+_RE_AVTO_DOP_CHAS = re.compile(r"(\d+(?:[.,]\d+)?)[ \t]*/[ \t]*наступна[ \t]*година", re.IGNORECASE)
+_RE_GIDROBORT = re.compile(r"гідроборт[ \t]*(\d+(?:[.,]\d+)?)", re.IGNORECASE)
+_RE_ROKLA = re.compile(r"рокла[ \t]*(\d+(?:[.,]\d+)?)", re.IGNORECASE)
+_RE_KM = re.compile(r"заміський[ \t]*(\d+(?:[.,]\d+)?)[ \t]*грн[ \t]*/[ \t]*км", re.IGNORECASE)
+_RE_GRUZCHIKI_HEADER = re.compile(r"тар[ \t]*\d+[ \t]*вантажник\w*[ \t]*(\d+(?:[.,]\d+)?)[ \t]*/[ \t]*(\d+(?:[.,]\d+)?)[ \t]*годин", re.IGNORECASE)
+_RE_GRUZCHIKI_DOP_CHAS = re.compile(r"(\d+(?:[.,]\d+)?)[ \t]*грн[ \t]*/[ \t]*наступна", re.IGNORECASE)
+_RE_VES = re.compile(r"ваг[іи][ \t]*від[ \t]*(\d+(?:[.,]\d+)?)[ \t]*по[ \t]*(\d+(?:[.,]\d+)?)[ \t]*грн[ \t]*/[ \t]*кг", re.IGNORECASE)
+_RE_VES_DOPY = re.compile(r"прохід[ \t]*\d+[ \t]*м[ \t]*/[ \t]*поверх[ \t]*з[ \t]*вагою[ \t]*по[ \t]*(\d+(?:[.,]\d+)?)[ \t]*грн[ \t]*на[ \t]*людину", re.IGNORECASE)
+_RE_KOM_PERCENT = re.compile(r"ком[ \t]*(\d+(?:[.,]\d+)?)[ \t]*%", re.IGNORECASE)
 
 
 _RE_ROKLA_GENERAL = re.compile(
-    r"(?:рокла\s*(\d+(?:[.,]\d+)?))|(?:(\d+(?:[.,]\d+)?)\s*рокла)", re.IGNORECASE
+    r"(?:рокла[ \t]*(\d+(?:[.,]\d+)?))|(?:(\d+(?:[.,]\d+)?)[ \t]*рокла)", re.IGNORECASE
 )
-_RE_KM_GENERAL = re.compile(r"(\d+(?:[.,]\d+)?)\s*грн\s*/\s*км", re.IGNORECASE)
+_RE_KM_GENERAL = re.compile(r"(\d+(?:[.,]\d+)?)[ \t]*грн[ \t]*/[ \t]*км", re.IGNORECASE)
 
 
 def _apply_keyword_overrides(result: dict, order_text: str):
