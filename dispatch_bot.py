@@ -593,6 +593,38 @@ _FIVE_NUMBERS_RE = re.compile(
 )
 
 
+def _recover_avto_dop_chas(result: dict, order_text: str):
+    """Страховка: если GPT нашёл avto_baza, но НЕ нашёл avto_dop_chas
+    (осталось null) - пробуем достать его напрямую регэкспом из текста.
+    Реальный случай (11.08): "4750/950БН" - число доп.часа СЛИПЛОСЬ с
+    формой оплаты без пробела ("950БН"), GPT не смог вычленить числовую
+    часть и заодно ошибочно решил, что раз второго числа нет - это
+    "фикс". НЕ пропускаем проверку из-за tip_rascheta="фикс" - как раз в
+    этом состоянии чаще всего и нужно восстановление: если в тексте
+    реально есть "<база>/<число>", тариф почасовый, что бы GPT ни решил.
+    """
+    if result.get("avto_dop_chas") is not None:
+        return
+    baza = result.get("avto_baza")
+    if baza is None:
+        return
+    text = order_text or ""
+    # Ищем только рядом со словом "тариф"/"тар" - не по всему тексту,
+    # чтобы случайно не зацепить похожее число из адреса/телефона в
+    # другом месте заявки.
+    kw = re.search(r"тар(?:иф)?", text, re.IGNORECASE)
+    search_region = text[kw.start():kw.start() + 120] if kw else text
+    baza_str = re.escape(_fmt_num(baza))
+    m = re.search(rf"{baza_str}\s*/\s*(\d+(?:[.,]\d+)?)", search_region)
+    if not m:
+        return
+    try:
+        result["avto_dop_chas"] = float(m.group(1).replace(",", "."))
+        result["tip_rascheta"] = "почасовка"
+    except ValueError:
+        pass
+
+
 def _apply_vitaliya_sanobrobka_template(result: dict, order_text: str):
     """Детерминированный оверрайд для конкретного повторяющегося шаблона
     (источник 'Виталия' + упоминание санобработки): тариф авто из 5 чисел
@@ -845,6 +877,7 @@ def parse_tariff_via_gpt(order_text: str) -> dict:
         raw = re.sub(r"^```json\s*|\s*```$", "", raw.strip())
         result = json.loads(raw)
         _apply_vitaliya_sanobrobka_template(result, order_text)
+        _recover_avto_dop_chas(result, order_text)
         _strip_bogus_gruzchiki(result, order_text)
         _strip_bogus_kom(result, order_text)
         result["neponyatno"] = _filter_neponyatno(result)
