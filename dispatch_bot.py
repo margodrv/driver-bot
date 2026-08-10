@@ -482,6 +482,26 @@ _TARIFF_SYSTEM_PROMPT = """\
 (ВАЖНО: третье число "10" у комиссии грузчиков НЕ теряется - идёт в dopy,
 даже если непонятно, за что именно оно - как и с gruzchiki_dopy, не
 классифицируем, просто сохраняем.)
+
+ПОДТВЕРЖДЁННЫЙ ПОВТОРЯЮЩИЙСЯ ШАБЛОН - применяй ТОЛЬКО если в тексте
+заявки ОДНОВРЕМЕННО есть ОБА условия: 1) упоминание санобработки ("Сан.
+оброботка"/"санобробка"/"санітарна обробка") И 2) имя "Виталия" где-либо
+в тексте (это конкретный источник заказов с таким форматом тарифа, не
+общее правило для любых пяти чисел - у других источников то же
+количество чисел может означать совсем другое):
+Вход: "Тар БН 2ч 2100/600/200/1000/44\n...Санк книжка, Сан. оброботка...\n...Виталия заказ"
+Выход (фрагмент): "avto_baza": 2100, "avto_dop_chas": 600, "forma_oplaty":
+"БН", "min_chasov": 2, "kom_avto": null, "kom_gruzchiki": null, "tariff_json":
+{"dop_tochka": {"tip": "doplata_fix", "summa": 200}, "prochie_dopy":
+[{"nazvanie": "Санобробка", "summa": 1000}], "km_stavka": 44}
+(В ЭТОМ конкретном шаблоне "Тар <форма_оплаты> <мін.час>ч
+база/доп_час/точка/санобробка/км" - ПЯТЬ чисел подряд - это тариф авто с
+тремя доп.платежами (доп.точка/санобробка/км), НИКОГДА не комиссия и
+НИКОГДА не грузчики. Санобробка узнаётся по фразе даже если она написана
+в другом месте текста, а не рядом с самими числами. Если условие
+"санобработка + Виталия" НЕ выполняется - это правило НЕ применяй,
+разбирай пять чисел обычными правилами выше (по ключевым словам рядом, а
+что не понятно - в neponyatno).)
 """
 
 
@@ -566,6 +586,62 @@ def find_pending_neponyatno_value(tariff: dict, field_key: str):
 _LOADER_TEXT_RE = re.compile(r"вантаж|грузчик", re.IGNORECASE)
 
 
+_VITALIYA_RE = re.compile(r"виталия", re.IGNORECASE)
+_SANOBROBKA_RE = re.compile(r"сан\.?\s*о?бр[оа]б", re.IGNORECASE)
+_FIVE_NUMBERS_RE = re.compile(
+    r"(\d+(?:[.,]\d+)?)\s*/\s*(\d+(?:[.,]\d+)?)\s*/\s*(\d+(?:[.,]\d+)?)\s*/\s*(\d+(?:[.,]\d+)?)\s*/\s*(\d+(?:[.,]\d+)?)"
+)
+
+
+def _apply_vitaliya_sanobrobka_template(result: dict, order_text: str):
+    """Детерминированный оверрайд для конкретного повторяющегося шаблона
+    (источник 'Виталия' + упоминание санобработки): тариф авто из 5 чисел
+    ВСЕГДА означает база/доп_час/точка/санобробка/км - подтверждено
+    логистом-владельцем как железное правило. Не полагаемся на то, что
+    GPT правильно применит инструкцию из промпта (после нескольких
+    ошибок в этом же кейсе) - переопределяем результат кодом напрямую,
+    если оба условия совпали и в тексте нашлись ровно 5 чисел подряд.
+
+    Применяется ТОЛЬКО при обоих условиях сразу - для других источников/
+    заказов те же пять чисел могут означать что угодно другое, трогать
+    их нельзя.
+    """
+    if not (_VITALIYA_RE.search(order_text or "") and _SANOBROBKA_RE.search(order_text or "")):
+        return
+    m = _FIVE_NUMBERS_RE.search(order_text or "")
+    if not m:
+        return  # формат не совпал - не рискуем, оставляем как разобрал GPT
+
+    baza, dop_chas, tochka, san, km = (float(g.replace(",", ".")) for g in m.groups())
+
+    result["avto_baza"] = baza
+    result["avto_dop_chas"] = dop_chas
+    result["tip_rascheta"] = "почасовка"
+    result["kom_avto"] = None
+    result["kom_gruzchiki"] = None
+    result["gruzchiki_baza"] = None
+    result["gruzchiki_dop_chas"] = None
+    result["gruzchiki_dopy"] = []
+
+    tj = result.setdefault("tariff_json", {})
+    tj["dop_tochka"] = {"tip": "doplata_fix", "summa": tochka}
+    tj["km_stavka"] = km
+    prochie = [d for d in (tj.get("prochie_dopy") or []) if (d.get("nazvanie") or "").strip().lower() != "санобробка"]
+    prochie.append({"nazvanie": "Санобробка", "summa": san})
+    tj["prochie_dopy"] = prochie
+
+    # Числа теперь классифицированы детерминированно - убираем по ним
+    # любые предупреждения "не понял", если GPT успел их туда добавить.
+    used = {_fmt_num(n) for n in (baza, dop_chas, tochka, san, km)}
+    kept = []
+    for item in result.get("neponyatno") or []:
+        m2 = _NEPONYATNO_ITEM_RE.match(item)
+        if m2 and m2.group(1) in used:
+            continue
+        kept.append(item)
+    result["neponyatno"] = kept
+
+
 def _strip_bogus_gruzchiki(result: dict, order_text: str):
     """КРИТИЧНАЯ защита: если в самом тексте заявки нет ни слова
     'вантажник', ни 'грузчик' - в заказе НЕТ грузчиков, точка. Обнаружен
@@ -595,6 +671,48 @@ def _strip_bogus_gruzchiki(result: dict, order_text: str):
     result["gruzchiki_baza"] = None
     result["gruzchiki_dop_chas"] = None
     result["gruzchiki_dopy"] = []
+
+    neponyatno = list(result.get("neponyatno") or [])
+    for n in stray:
+        neponyatno.append(f"{_fmt_num(n)}: ГБ?/точка?/км?")
+    result["neponyatno"] = neponyatno
+
+
+_KOM_TEXT_RE = re.compile(r"ком|коміс", re.IGNORECASE)
+
+
+def _kom_stray_numbers(k):
+    if not k:
+        return []
+    if k.get("tip") == "pochasovka":
+        nums = []
+        if k.get("baza") is not None:
+            nums.append(k["baza"])
+        if k.get("dop_chas") is not None:
+            nums.append(k["dop_chas"])
+        nums.extend(k.get("dopy") or [])
+        return nums
+    if k.get("znachenie") is not None and k.get("tip") != "%":
+        return [k["znachenie"]]  # % без слова "ком" тоже подозрительно, но сумма надёжнее показывает утечку чисел
+    return []
+
+
+def _strip_bogus_kom(result: dict, order_text: str):
+    """Аналогичная защита для комиссии: если в тексте заявки вообще нет
+    слова 'ком'/'коміс' - kom_avto/kom_gruzchiki не должны быть заполнены
+    вообще, даже если GPT попытался впихнуть туда лишние числа из строки
+    тарифа авто (реальный кейс 10.08: "2100/600/200/1000/44" без единого
+    слова про комиссию - GPT насочинял kom_avto из чисел, которые на
+    самом деле доп.точка/санобробка/км)."""
+    if _KOM_TEXT_RE.search(order_text or ""):
+        return  # текст явно упоминает комиссию - не трогаем
+
+    stray = _kom_stray_numbers(result.get("kom_avto")) + _kom_stray_numbers(result.get("kom_gruzchiki"))
+    if not stray:
+        return
+
+    result["kom_avto"] = None
+    result["kom_gruzchiki"] = None
 
     neponyatno = list(result.get("neponyatno") or [])
     for n in stray:
@@ -726,7 +844,9 @@ def parse_tariff_via_gpt(order_text: str) -> dict:
         raw = completion.choices[0].message.content.strip()
         raw = re.sub(r"^```json\s*|\s*```$", "", raw.strip())
         result = json.loads(raw)
+        _apply_vitaliya_sanobrobka_template(result, order_text)
         _strip_bogus_gruzchiki(result, order_text)
+        _strip_bogus_kom(result, order_text)
         result["neponyatno"] = _filter_neponyatno(result)
         _strip_bogus_gidrobort(result)
         _reconcile_neponyatno(result)
