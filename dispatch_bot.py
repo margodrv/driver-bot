@@ -647,6 +647,105 @@ def _recover_avto_dop_chas(result: dict, order_text: str):
         pass
 
 
+_TEMPLATE_MARKERS = ("тар авто", "наступна година", "гідроборт", "рокла", "заміський", "вантажник", "вагі від", "прохід")
+
+_RE_AVTO_BAZA_HOURS = re.compile(r"тар\s*авто\s*(\d+(?:[.,]\d+)?)\s*грн\s*/\s*(\d+(?:[.,]\d+)?)\s*годин", re.IGNORECASE)
+_RE_AVTO_DOP_CHAS = re.compile(r"(\d+(?:[.,]\d+)?)\s*/\s*наступна\s*година", re.IGNORECASE)
+_RE_GIDROBORT = re.compile(r"гідроборт\s*(\d+(?:[.,]\d+)?)", re.IGNORECASE)
+_RE_ROKLA = re.compile(r"рокла\s*(\d+(?:[.,]\d+)?)", re.IGNORECASE)
+_RE_KM = re.compile(r"заміський\s*(\d+(?:[.,]\d+)?)\s*грн\s*/\s*км", re.IGNORECASE)
+_RE_GRUZCHIKI_HEADER = re.compile(r"тар\s*\d+\s*вантажник\w*\s*(\d+(?:[.,]\d+)?)\s*/\s*(\d+(?:[.,]\d+)?)\s*годин", re.IGNORECASE)
+_RE_GRUZCHIKI_DOP_CHAS = re.compile(r"(\d+(?:[.,]\d+)?)\s*грн\s*/\s*наступна", re.IGNORECASE)
+_RE_VES = re.compile(r"ваг[іи]\s*від\s*(\d+(?:[.,]\d+)?)\s*по\s*(\d+(?:[.,]\d+)?)\s*грн\s*/\s*кг", re.IGNORECASE)
+_RE_VES_DOPY = re.compile(r"прохід\s*\d+\s*м\s*/\s*поверх\s*з\s*вагою\s*по\s*(\d+(?:[.,]\d+)?)\s*грн\s*на\s*людину", re.IGNORECASE)
+_RE_KOM_PERCENT = re.compile(r"ком\s*(\d+(?:[.,]\d+)?)\s*%", re.IGNORECASE)
+
+
+def _apply_avto_gruzchiki_multiline_template(result: dict, order_text: str):
+    """Детерминированный разбор для другого повторяющегося многострочного
+    шаблона: 'Тар авто X/Yгодини', '.../Наступна година', '+гідроборт',
+    '+рокла', '+заміський .../км', затем блок 'Тар N вантажника ...',
+    'Вагі від...', 'Прохід ...з вагою по...'. После нескольких повторных
+    ошибок GPT в этом же кейсе (доп.точка вместо км, доп.ходка вместо
+    рокла, потерянный вес, метры вместо этажей) - не полагаемся на GPT
+    для этого шаблона вообще, разбираем прямым регэкспом по фиксированным
+    меткам-словам.
+
+    Срабатывает только если в тексте есть ВСЕ характерные маркеры этого
+    шаблона одновременно - иначе не трогаем результат.
+    """
+    text_low = (order_text or "").lower()
+    if not all(marker in text_low for marker in _TEMPLATE_MARKERS):
+        return
+
+    m = _RE_AVTO_BAZA_HOURS.search(order_text)
+    if not m:
+        return  # не тот формат, не рискуем
+    result["avto_baza"] = float(m.group(1).replace(",", "."))
+    result["min_chasov"] = float(m.group(2).replace(",", "."))
+    result["tip_rascheta"] = "почасовка"
+
+    m = _RE_AVTO_DOP_CHAS.search(order_text)
+    if m:
+        result["avto_dop_chas"] = float(m.group(1).replace(",", "."))
+
+    tj = result.setdefault("tariff_json", {})
+    # В этом шаблоне доп.точки и доп.ходки не бывает вообще - если GPT их
+    # ошибочно насочинял из чисел гідроборта/рокли/км, явно обнуляем, а
+    # не просто дополняем результат сверху.
+    tj["dop_tochka"] = None
+    tj["dop_hodka"] = None
+
+    m = _RE_GIDROBORT.search(order_text)
+    if m:
+        tj["gidrobort"] = {"summa": float(m.group(1).replace(",", ".")), "po_faktu": True}
+
+    prochie = [d for d in (tj.get("prochie_dopy") or []) if (d.get("nazvanie") or "").strip().lower() not in ("рокла", "допы с весом")]
+
+    m = _RE_ROKLA.search(order_text)
+    if m:
+        prochie.append({"nazvanie": "Рокла", "summa": float(m.group(1).replace(",", ".")), "group": "avto"})
+
+    m = _RE_KM.search(order_text)
+    if m:
+        tj["km_stavka"] = float(m.group(1).replace(",", "."))
+
+    m = _RE_GRUZCHIKI_HEADER.search(order_text)
+    if m:
+        result["gruzchiki_baza"] = float(m.group(1).replace(",", "."))
+        result["gruzchiki_chasov"] = float(m.group(2).replace(",", "."))
+
+    m = _RE_GRUZCHIKI_DOP_CHAS.search(order_text)
+    if m:
+        result["gruzchiki_dop_chas"] = float(m.group(1).replace(",", "."))
+    result["gruzchiki_dopy"] = []  # в этом шаблоне все доп.числа классифицированы явно, "хвоста" не остаётся
+
+    m = _RE_VES.search(order_text)
+    if m:
+        tj["ves"] = {
+            "tip": "porogovaya",
+            "porogi": [{"ot": float(m.group(1).replace(",", ".")), "stavka": float(m.group(2).replace(",", "."))}],
+        }
+
+    m = _RE_VES_DOPY.search(order_text)
+    if m:
+        prochie.append({"nazvanie": "Допы с весом", "summa": float(m.group(1).replace(",", ".")), "group": "gruzchiki"})
+
+    tj["prochie_dopy"] = prochie
+    tj["etazhi_stavka"] = None  # "Прохід 20м" - метры, не грн, это НЕ этажи (см. правило выше)
+    tj["prohody_stavka"] = None  # эта фраза целиком уже разобрана как "Допы с весом" выше
+
+    m = _RE_KOM_PERCENT.search(order_text)
+    if m:
+        result["kom_avto"] = {"znachenie": float(m.group(1).replace(",", ".")), "tip": "%"}
+
+    result["kom_gruzchiki"] = None  # в этом шаблоне комиссия одна общая, не отдельная для грузчиков
+
+    # Все числа этого шаблона теперь классифицированы детерминированно -
+    # предупреждения "не понял" по ним больше не нужны.
+    result["neponyatno"] = []
+
+
 def _apply_vitaliya_sanobrobka_template(result: dict, order_text: str):
     """Детерминированный оверрайд для конкретного повторяющегося шаблона
     (источник 'Виталия' + упоминание санобработки): тариф авто из 5 чисел
@@ -899,6 +998,7 @@ def parse_tariff_via_gpt(order_text: str) -> dict:
         raw = re.sub(r"^```json\s*|\s*```$", "", raw.strip())
         result = json.loads(raw)
         _apply_vitaliya_sanobrobka_template(result, order_text)
+        _apply_avto_gruzchiki_multiline_template(result, order_text)
         _recover_avto_dop_chas(result, order_text)
         _strip_bogus_gruzchiki(result, order_text)
         _strip_bogus_kom(result, order_text)
