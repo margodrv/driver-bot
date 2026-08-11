@@ -665,6 +665,14 @@ _RE_ROKLA_GENERAL = re.compile(
     r"(?:рокла[ \t]*(\d+(?:[.,]\d+)?))|(?:(\d+(?:[.,]\d+)?)[ \t]*рокла)", re.IGNORECASE
 )
 _RE_KM_GENERAL = re.compile(r"(\d+(?:[.,]\d+)?)[ \t]*грн[ \t]*/[ \t]*км", re.IGNORECASE)
+_RE_VES_THRESHOLD_GENERAL = re.compile(
+    r"ваг\w*[ \t]*від[ \t]*(\d+(?:[.,]\d+)?)[ \t]*по[ \t]*(\d+(?:[.,]\d+)?)[ \t]*грн[ \t]*/[ \t]*кг", re.IGNORECASE
+)
+_RE_PROHOD_ETAZH_COMBINED = re.compile(
+    r"(?:(?:прохід|проход)[ \t]*/[ \t]*поверх|поверх[ \t]*/[ \t]*(?:прохід|проход))"
+    r"[ \t]*(?:пішки)?[ \t]*по[ \t]*(\d+(?:[.,]\d+)?)",
+    re.IGNORECASE,
+)
 
 
 def _apply_keyword_overrides(result: dict, order_text: str):
@@ -715,6 +723,25 @@ def _apply_keyword_overrides(result: dict, order_text: str):
         tj["km_stavka"] = val
         if (tj.get("dop_tochka") or {}).get("summa") == val:
             tj["dop_tochka"] = None
+
+    m = _RE_VES_THRESHOLD_GENERAL.search(order_text or "")
+    if m:
+        # Явная пороговая формулировка ("Вагі від 80 по 5грн/кг") -
+        # доверенное значение, не путаем с "лишними числами грузчиков",
+        # которые обычно и заставляют нас подавлять это поле.
+        ot = float(m.group(1).replace(",", "."))
+        stavka = float(m.group(2).replace(",", "."))
+        tj["ves"] = {"tip": "porogovaya", "porogi": [{"ot": ot, "stavka": stavka}]}
+        result["_ves_trusted"] = True
+
+    m = _RE_PROHOD_ETAZH_COMBINED.search(order_text or "")
+    if m:
+        # "Прохід/поверх ... по N" - ОДНА ставка сразу на оба понятия,
+        # не выбираем одно из двух, показываем обе строки одинаковой
+        # ценой (так и написано в тексте).
+        val = float(m.group(1).replace(",", "."))
+        tj["etazhi_stavka"] = val
+        tj["prohody_stavka"] = val
 
 
 def _apply_avto_gruzchiki_multiline_template(result: dict, order_text: str):
@@ -1082,14 +1109,15 @@ def _strip_ves_when_gruzchiki(result: dict):
     пороговой таблицей веса - один раз с совпадающими числами (что ловил
     предыдущий дедуп), второй раз со сломанной структурой (порог без
     ставки: 'від 50кг по грн'). Раз даже сравнение чисел ненадёжно -
-    просто НЕ доверяем полю 'ves', когда в заказе вообще есть грузчики.
-    Подтверждено логистом-владельцем: такие числа - это допы, а не
-    структурированный вес, даже если среди них есть правдоподобное
-    значение (например действительно похожее на грн/кг) - разбираться,
-    что из чисел реально вес, логист будет сам, глядя на исходный текст.
-    Реальная пороговая таблица веса (случай F) настолько редка и
-    специфично описана в тексте, что подавляющее большинство срабатываний
-    этого поля при наличии грузчиков - ошибка, а не находка."""
+    просто НЕ доверяем полю 'ves', когда в заказе вообще есть грузчики -
+    ЕСЛИ ТОЛЬКО значение не пришло из доверенного regex-правила
+    (_RE_VES_THRESHOLD_GENERAL, флаг "_ves_trusted") - явная формулировка
+    "Вагі від X по Yгрн/кг" достаточно однозначна, чтобы ей доверять даже
+    при наличии грузчиков (реальный кейс 11.08: "Вага від 80 по 5грн/кг"
+    пропадала полностью из-за этой же защиты, хотя была явно указана).
+    """
+    if result.pop("_ves_trusted", False):
+        return
     if result.get("gruzchiki_baza") is None:
         return
     tj = result.get("tariff_json") or {}
