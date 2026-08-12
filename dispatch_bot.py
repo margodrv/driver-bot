@@ -1032,7 +1032,7 @@ def _strip_bogus_dop_tochka_without_word(result: dict, order_text: str):
     - если и рокла не упомянута - просто убираем в neponyatno, не
       теряя число молча
     """
-    tj = result.get("tariff_json") or {}
+    tj = result.setdefault("tariff_json", {})
     dt = tj.get("dop_tochka")
     if not dt or dt.get("summa") is None:
         return
@@ -1060,7 +1060,7 @@ def _strip_duplicate_dop_tochka_km(result: dict, order_text: str):
     совпадает по сумме с км, а слова 'точка' в тексте нет вообще - это
     дубль, убираем доп.точку.
     """
-    tj = result.get("tariff_json") or {}
+    tj = result.setdefault("tariff_json", {})
     dt = tj.get("dop_tochka")
     km = tj.get("km_stavka")
     if not dt or km is None:
@@ -1081,7 +1081,7 @@ def _strip_implausible_dop_tochka(result: dict):
     правдоподобный диапазон ГБ (200-800, кратно 50) - иначе не путаем
     логиста заведомо неподходящим вариантом.
     """
-    tj = result.get("tariff_json") or {}
+    tj = result.setdefault("tariff_json", {})
     dt = tj.get("dop_tochka")
     if not dt or dt.get("summa") is None:
         return
@@ -1100,7 +1100,7 @@ def _strip_implausible_gidrobort(result: dict):
     """Симметрично доп.точке: ГБ всегда 200/250/300.../800 (кратно 50) -
     никогда не бывает мелких чисел. Если GPT поставил в гідроборт число
     вне диапазона - убираем, переносим в neponyatno."""
-    tj = result.get("tariff_json") or {}
+    tj = result.setdefault("tariff_json", {})
     gb = tj.get("gidrobort")
     if not gb or gb.get("summa") is None:
         return
@@ -1122,7 +1122,7 @@ def _strip_implausible_etazhi_prohody(result: dict):
     Убираем значения вне правдоподобного диапазона молча, без переноса
     в neponyatno - в отличие от доп.точки/ГБ, тут восстанавливать
     нечего, это просто мусор."""
-    tj = result.get("tariff_json") or {}
+    tj = result.setdefault("tariff_json", {})
     for key, (lo, hi) in (("etazhi_stavka", (20, 100)), ("prohody_stavka", (20, 50))):
         v = tj.get(key)
         if v is not None and not (lo <= v <= hi):
@@ -1158,7 +1158,7 @@ def _strip_bogus_gidrobort(result: dict):
     Если логист вручную решит, что доплата всё же нужна - внесёт через
     кнопку 'ГБ' в меню правки, как обычно.
     """
-    tj = result.get("tariff_json") or {}
+    tj = result.setdefault("tariff_json", {})
     gb = tj.get("gidrobort")
     if gb and not gb.get("summa"):
         tj["gidrobort"] = None
@@ -1182,7 +1182,7 @@ def _reconcile_neponyatno(result: dict):
        Переносим такие числа в gruzchiki_dopy и убираем предупреждение -
        не теряем число молча и не пугаем логиста лишним вопросом.
     """
-    tj = result.get("tariff_json") or {}
+    tj = result.setdefault("tariff_json", {})
     used_numbers = set()
     for key in ("dop_tochka", "gidrobort"):
         d = tj.get(key)
@@ -1227,6 +1227,42 @@ def _reconcile_neponyatno(result: dict):
     _strip_ves_when_gruzchiki(result)
 
 
+def _apply_hodka_context_to_dop_tochka(result: dict, order_text: str):
+    """Подтверждено: слово 'ходка'/'ходки' в тексте (даже не рядом с
+    самим числом - например "(три ходки)" в описании точки маршрута,
+    а число - в отдельной строке тарифа) - сигнал, что неклассифицированное
+    число, скорее всего, доп.точка. Реальный кейс: "Тар 4500/1000/500" +
+    где-то в тексте "(три ходки)" - GPT оставил 500 в 'не понял', хотя
+    по контексту это явно доп.точка.
+
+    Если доп.точка уже определена - не трогаем. Ищем среди 'не понял'
+    первое число, подходящее по диапазону (150-700+, кратно 50), и
+    переводим его в доп.точку.
+    """
+    if "ходк" not in (order_text or "").lower():
+        return
+    tj = result.setdefault("tariff_json", {})
+    if tj.get("dop_tochka"):
+        return  # уже определена явно - не переопределяем по контексту
+
+    kept = []
+    applied = False
+    for item in result.get("neponyatno") or []:
+        if not applied:
+            m = _NEPONYATNO_ITEM_RE.match(item)
+            if m:
+                try:
+                    val = float(m.group(1).replace(",", "."))
+                except ValueError:
+                    val = None
+                if val is not None and val >= 150 and val % 50 == 0:
+                    tj["dop_tochka"] = {"tip": "doplata_fix", "summa": val}
+                    applied = True
+                    continue  # разрешили - эта строка предупреждения больше не нужна
+        kept.append(item)
+    result["neponyatno"] = kept
+
+
 def _strip_ves_when_gruzchiki(result: dict):
     """GPT дважды подряд путал числа из строки 'Вантажники ...' с
     пороговой таблицей веса - один раз с совпадающими числами (что ловил
@@ -1243,7 +1279,7 @@ def _strip_ves_when_gruzchiki(result: dict):
         return
     if result.get("gruzchiki_baza") is None:
         return
-    tj = result.get("tariff_json") or {}
+    tj = result.setdefault("tariff_json", {})
     if tj.get("ves"):
         tj["ves"] = None
 
@@ -1292,6 +1328,7 @@ def parse_tariff_via_gpt(order_text: str) -> dict:
         _strip_implausible_etazhi_prohody(result)
         _normalize_forma_oplaty(result)
         _reconcile_neponyatno(result)
+        _apply_hodka_context_to_dop_tochka(result, order_text)
         return result
     except Exception as e:
         logger.error(f"Ошибка разбора тарифа через GPT: {e}")
