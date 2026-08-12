@@ -586,14 +586,19 @@ _CANDIDATE_FIELD_LABELS = {
 
 
 def find_pending_neponyatno_value(tariff: dict, field_key: str):
-    """Если для этого поля есть подходящее число в 'не понял' (например
-    '600: ГБ?/точка?/км?' и поле - gidrobort) - возвращает это число как
-    строку, чтобы применить его сразу, без переспроса. Если совпадения
-    нет (в том числе если это обычное поле вроде 'Авто база', для
-    которого кандидатов не бывает) - возвращает None, обычный флоу."""
+    """Если для этого поля есть РОВНО ОДНО подходящее число в 'не понял'
+    (например '600: ГБ?/точка?/км?' и поле - gidrobort) - возвращает это
+    число как строку, чтобы применить его сразу, без переспроса.
+
+    Если совпадений НЕТ, или их НЕСКОЛЬКО (несколько разных
+    неоднозначных чисел одновременно предлагают одну и ту же категорию -
+    реальный кейс: 4 предупреждения подряд с одинаковыми кандидатами
+    "ГБ?/точка?/км?", нажатие "Км" не должно угадывать, какое из них
+    имелось в виду) - возвращает None, обычный флоу с ручным вводом."""
     label = _CANDIDATE_FIELD_LABELS.get(field_key)
     if not label:
         return None
+    matches = []
     for item in tariff.get("neponyatno") or []:
         m = _NEPONYATNO_ITEM_RE.match(item)
         if not m:
@@ -601,11 +606,11 @@ def find_pending_neponyatno_value(tariff: dict, field_key: str):
         num_str, cands_str = m.groups()
         cands = [c.strip().rstrip("?").lower() for c in cands_str.split("/") if c.strip()]
         if label in cands:
-            return num_str
-    return None
+            matches.append(num_str)
+    return matches[0] if len(matches) == 1 else None
 
 
-_LOADER_TEXT_RE = re.compile(r"вантаж|грузчик", re.IGNORECASE)
+_LOADER_TEXT_RE = re.compile(r"вантаж|груз", re.IGNORECASE)
 
 
 _VITALIYA_RE = re.compile(r"виталия", re.IGNORECASE)
@@ -672,6 +677,9 @@ _RE_PROHOD_ETAZH_COMBINED = re.compile(
     r"(?:(?:прохід|проход)[ \t]*/[ \t]*поверх|поверх[ \t]*/[ \t]*(?:прохід|проход))"
     r"[ \t]*(?:пішки)?[ \t]*по[ \t]*(\d+(?:[.,]\d+)?)",
     re.IGNORECASE,
+)
+_RE_ETAZH_GENERAL = re.compile(
+    r"(?:поверх[ \t]*(\d+(?:[.,]\d+)?))|(?:(\d+(?:[.,]\d+)?)[ \t]*поверх)", re.IGNORECASE
 )
 
 
@@ -742,6 +750,19 @@ def _apply_keyword_overrides(result: dict, order_text: str):
         val = float(m.group(1).replace(",", "."))
         tj["etazhi_stavka"] = val
         tj["prohody_stavka"] = val
+    else:
+        m = _RE_ETAZH_GENERAL.search(order_text or "")
+        if m:
+            val = float((m.group(1) or m.group(2)).replace(",", "."))
+            if 20 <= val <= 100:
+                # Правдоподобное значение - "поверх"/"этаж" рядом с
+                # числом - это ВСЕГДА этаж, даже если GPT почему-то не
+                # применил этот триггер сам (реальный кейс 12.08:
+                # "25поверх" в третьем числе тарифа авто GPT не распознал
+                # несмотря на явный триггер рядом).
+                tj["etazhi_stavka"] = val
+                if (tj.get("dop_tochka") or {}).get("summa") == val:
+                    tj["dop_tochka"] = None
 
 
 def _apply_avto_gruzchiki_multiline_template(result: dict, order_text: str):
@@ -1006,6 +1027,20 @@ def _strip_implausible_gidrobort(result: dict):
         result["neponyatno"] = neponyatno
 
 
+def _strip_implausible_etazhi_prohody(result: dict):
+    """Реальный кейс (12.08): GPT поставил etazhi_stavka=0 - мусорное
+    значение, не связанное ни с одним реальным числом в тексте (0 не
+    несёт информации, показывать его как предупреждение бессмысленно).
+    Убираем значения вне правдоподобного диапазона молча, без переноса
+    в neponyatno - в отличие от доп.точки/ГБ, тут восстанавливать
+    нечего, это просто мусор."""
+    tj = result.get("tariff_json") or {}
+    for key, (lo, hi) in (("etazhi_stavka", (20, 100)), ("prohody_stavka", (20, 50))):
+        v = tj.get(key)
+        if v is not None and not (lo <= v <= hi):
+            tj[key] = None
+
+
 _FORMA_NAL_RE = re.compile(r"нал|готів", re.IGNORECASE)
 _FORMA_BN_RE = re.compile(r"без\s*нал|\bб\s*/?\s*н\b", re.IGNORECASE)
 
@@ -1163,6 +1198,7 @@ def parse_tariff_via_gpt(order_text: str) -> dict:
         _strip_bogus_gidrobort(result)
         _strip_implausible_dop_tochka(result)
         _strip_implausible_gidrobort(result)
+        _strip_implausible_etazhi_prohody(result)
         _normalize_forma_oplaty(result)
         _reconcile_neponyatno(result)
         return result
@@ -1529,12 +1565,26 @@ def _apply_forma_oplaty(tariff, text):
     tariff["forma_oplaty"] = _parse_forma_oplaty(text)
 
 
-def _resolve_neponyatno(tariff):
-    """При правке любого из 'кандидатных' полей (ГБ/точка/этаж/проход)
-    считаем неоднозначность разрешённой и снимаем предупреждения - иначе
-    строка '⚠️ не понял: 600 ГБ?/точка?...' зависла бы в превью даже
-    после того, как логист явно указал, чем число является."""
-    tariff["neponyatno"] = []
+def _resolve_neponyatno(tariff, value=None):
+    """При правке 'кандидатного' поля (ГБ/точка/этаж/проход/км/вес)
+    убираем из 'не понял' ТОЛЬКО строку с этим конкретным числом - не
+    весь список сразу. Реальный кейс: 4-5 разных неясных чисел
+    одновременно - разбор одного (например "90" в Км) не должен стирать
+    предупреждения по остальным (2600/1300/4/15), иначе логист теряет
+    из виду, что их всё ещё нужно разобрать.
+
+    Если value не передан (например при полной очистке поля через '-')
+    - оставляем предупреждения как есть, специально ничего не трогаем."""
+    if value is None:
+        return
+    val_str = _fmt_num(value)
+    kept = []
+    for item in tariff.get("neponyatno") or []:
+        m = _NEPONYATNO_ITEM_RE.match(item)
+        if m and m.group(1) == val_str:
+            continue  # это число только что разобрали - убираем предупреждение по нему
+        kept.append(item)
+    tariff["neponyatno"] = kept
 
 
 def _apply_gidrobort(tariff, text):
@@ -1542,7 +1592,6 @@ def _apply_gidrobort(tariff, text):
     tj = tariff.setdefault("tariff_json", {})
     if t in _EMPTY_VALUES:
         tj["gidrobort"] = None
-        _resolve_neponyatno(tariff)
         return
     v = _parse_one_number(text)
     if v == 0:
@@ -1550,7 +1599,7 @@ def _apply_gidrobort(tariff, text):
     if v < 200 or v > 800 or v % 50 != 0:
         raise ValueError(f"{_fmt_num(v)} не похоже на ГБ (обычно 200/250/300.../800, кратно 50) - проверьте цифру, возможно это км/доп.точка")
     tj["gidrobort"] = {"summa": v, "po_faktu": True}
-    _resolve_neponyatno(tariff)
+    _resolve_neponyatno(tariff, v)
 
 
 def _apply_dop_tochka(tariff, text):
@@ -1559,13 +1608,14 @@ def _apply_dop_tochka(tariff, text):
         raise ValueError(f"{_fmt_num(v)} не похоже на доп.точку (обычно 150/200/250.../700 и т.д., кратно 50) - проверьте цифру, возможно это км")
     tj = tariff.setdefault("tariff_json", {})
     tj["dop_tochka"] = {"tip": "doplata_fix", "summa": v}
-    _resolve_neponyatno(tariff)
+    _resolve_neponyatno(tariff, v)
 
 
 def _apply_km(tariff, text):
+    v = _parse_one_number(text)
     tj = tariff.setdefault("tariff_json", {})
-    tj["km_stavka"] = _parse_one_number(text)
-    _resolve_neponyatno(tariff)
+    tj["km_stavka"] = v
+    _resolve_neponyatno(tariff, v)
 
 
 def _apply_etazhi(tariff, text):
@@ -1574,7 +1624,7 @@ def _apply_etazhi(tariff, text):
         raise ValueError(f"{_fmt_num(v)} не похоже на этаж (обычно 20-100 грн: 20-30 для 1-10 этажа, до 100 выше) - проверьте цифру")
     tj = tariff.setdefault("tariff_json", {})
     tj["etazhi_stavka"] = v
-    _resolve_neponyatno(tariff)
+    _resolve_neponyatno(tariff, v)
 
 
 def _apply_prohody(tariff, text):
@@ -1583,7 +1633,7 @@ def _apply_prohody(tariff, text):
         raise ValueError(f"{_fmt_num(v)} не похоже на проход/допу (обычно 20-30 без весовых предметов, до 50 с ними) - проверьте цифру")
     tj = tariff.setdefault("tariff_json", {})
     tj["prohody_stavka"] = v
-    _resolve_neponyatno(tariff)
+    _resolve_neponyatno(tariff, v)
 
 
 def _apply_ves(tariff, text):
@@ -1592,7 +1642,7 @@ def _apply_ves(tariff, text):
         raise ValueError(f"{_fmt_num(v)} многовато для веса (обычно до 15 грн/кг) - проверьте цифру")
     tj = tariff.setdefault("tariff_json", {})
     tj["ves"] = {"tip": "ploskaya", "stavka": v}
-    _resolve_neponyatno(tariff)
+    _resolve_neponyatno(tariff, v)
 
 
 def _apply_rokla(tariff, text):
@@ -1600,9 +1650,12 @@ def _apply_rokla(tariff, text):
     tj = tariff.setdefault("tariff_json", {})
     prochie = [d for d in (tj.get("prochie_dopy") or []) if (d.get("nazvanie") or "").strip().lower() != "рокла"]
     if t not in _EMPTY_VALUES:
-        prochie.append({"nazvanie": "Рокла", "summa": _parse_one_number(text), "group": "avto"})
-    tj["prochie_dopy"] = prochie
-    _resolve_neponyatno(tariff)
+        v = _parse_one_number(text)
+        prochie.append({"nazvanie": "Рокла", "summa": v, "group": "avto"})
+        tj["prochie_dopy"] = prochie
+        _resolve_neponyatno(tariff, v)
+    else:
+        tj["prochie_dopy"] = prochie
 
 
 # field_key -> {label, hint, apply(tariff, text), columns затрагиваемые в Sheets}
