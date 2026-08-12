@@ -448,14 +448,19 @@ _TARIFF_SYSTEM_PROMPT = """\
   "Сан. обробка"/"санобробка"/"санітарна обробка" рядом с числом -> клади
   в prochie_dopy с nazvanie "Санобробка".
 - Гидроборт (gidrobort) заполняй ТОЛЬКО если в тексте явно написано число
-  рядом со словом "гідроборт", означающее доплату (например "гідроборт
-  +950 якщо використовують"). ПОДТВЕРЖДЕНО: если "гідроборт" упомянут
+  рядом со словом "гідроборт". ПОДТВЕРЖДЕНО: если "гідроборт" упомянут
   просто как характеристика авто в описании машины (например "5т
   гідроборт + 2 вантажника") - БЕЗ суммы рядом - считается, что
   гідроборт УЖЕ включён в тариф авто, отдельно за него НЕ доплачивают.
   В этом случае gidrobort = null, НИКОГДА не ставь summa=0 или пустую
   структуру "для галочки". Если логист позже решит, что доплата всё же
   нужна - он внесёт её вручную через отдельную кнопку.
+  "po_faktu" ставь true ТОЛЬКО если в тексте явная оговорка условности
+  ("якщо буде"/"якщо використовують"/"по факту використання" рядом с
+  гідробортом, например "гідроборт +950 якщо використовують"). Если
+  гідроборт указан просто как обычное число в составе тарифа без такой
+  оговорки (например "Тар 2400/800/500пром точка/500 Гидроборт/60") -
+  po_faktu=false, это обычная фиксированная доплата, а не условная.
 - Любая сумма вида "від X" (например "збір меблів від 500грн") - это
   сумма, известная точно только по факту на месте (её может знать
   водитель, но не логист заранее) - НЕ помечай её в neponyatno (это не
@@ -802,7 +807,7 @@ def _apply_avto_gruzchiki_multiline_template(result: dict, order_text: str):
 
     m = _RE_GIDROBORT.search(order_text)
     if m:
-        tj["gidrobort"] = {"summa": float(m.group(1).replace(",", ".")), "po_faktu": True}
+        tj["gidrobort"] = {"summa": float(m.group(1).replace(",", ".")), "po_faktu": False}
 
     prochie = [d for d in (tj.get("prochie_dopy") or []) if (d.get("nazvanie") or "").strip().lower() not in ("рокла", "допы с весом")]
 
@@ -979,6 +984,23 @@ def _strip_bogus_kom(result: dict, order_text: str):
 
 def _is_plausible_gidrobort(v) -> bool:
     return 200 <= v <= 800 and v % 50 == 0
+
+
+def _strip_duplicate_dop_tochka_km(result: dict, order_text: str):
+    """Реальный кейс (15.08): текст содержал только 'Км 500' (без слова
+    'точка' вообще), а GPT ЗАОДНО сочинил доп.точку с той же суммой 500 -
+    чистое дублирование одного и того же числа под двумя названиями, не
+    опечатка в классификации, а выдумка целой сущности. Если доп.точка
+    совпадает по сумме с км, а слова 'точка' в тексте нет вообще - это
+    дубль, убираем доп.точку.
+    """
+    tj = result.get("tariff_json") or {}
+    dt = tj.get("dop_tochka")
+    km = tj.get("km_stavka")
+    if not dt or km is None:
+        return
+    if dt.get("summa") == km and "точк" not in (order_text or "").lower():
+        tj["dop_tochka"] = None
 
 
 def _strip_implausible_dop_tochka(result: dict):
@@ -1196,6 +1218,7 @@ def parse_tariff_via_gpt(order_text: str) -> dict:
         _strip_bogus_kom(result, order_text)
         result["neponyatno"] = _filter_neponyatno(result)
         _strip_bogus_gidrobort(result)
+        _strip_duplicate_dop_tochka_km(result, order_text)
         _strip_implausible_dop_tochka(result)
         _strip_implausible_gidrobort(result)
         _strip_implausible_etazhi_prohody(result)
@@ -1310,7 +1333,8 @@ def _format_avto_extra_lines(tj: dict, star) -> list:
 
     gb = tj.get("gidrobort")
     if gb and gb.get("summa"):
-        lines.append(f"Гідроборт: {_fmt_num(gb.get('summa'))} (по факту){star(['gidrobort'])}")
+        suffix = " (по факту)" if gb.get("po_faktu") else ""
+        lines.append(f"Гідроборт: {_fmt_num(gb.get('summa'))}{suffix}{star(['gidrobort'])}")
 
     dh = tj.get("dop_hodka")
     if dh:
@@ -1598,49 +1622,69 @@ def _apply_gidrobort(tariff, text):
         raise ValueError("0 не похоже на доплату 'по факту' - если доплаты нет, оставьте пустым ('-')")
     if v < 200 or v > 800 or v % 50 != 0:
         raise ValueError(f"{_fmt_num(v)} не похоже на ГБ (обычно 200/250/300.../800, кратно 50) - проверьте цифру, возможно это км/доп.точка")
-    tj["gidrobort"] = {"summa": v, "po_faktu": True}
+    tj["gidrobort"] = {"summa": v, "po_faktu": False}
     _resolve_neponyatno(tariff, v)
 
 
 def _apply_dop_tochka(tariff, text):
+    t = text.strip().lower()
+    tj = tariff.setdefault("tariff_json", {})
+    if t in _EMPTY_VALUES:
+        tj["dop_tochka"] = None
+        return
     v = _parse_one_number(text)
     if v < 150 or v % 50 != 0:
         raise ValueError(f"{_fmt_num(v)} не похоже на доп.точку (обычно 150/200/250.../700 и т.д., кратно 50) - проверьте цифру, возможно это км")
-    tj = tariff.setdefault("tariff_json", {})
     tj["dop_tochka"] = {"tip": "doplata_fix", "summa": v}
     _resolve_neponyatno(tariff, v)
 
 
 def _apply_km(tariff, text):
-    v = _parse_one_number(text)
+    t = text.strip().lower()
     tj = tariff.setdefault("tariff_json", {})
+    if t in _EMPTY_VALUES:
+        tj["km_stavka"] = None
+        return
+    v = _parse_one_number(text)
     tj["km_stavka"] = v
     _resolve_neponyatno(tariff, v)
 
 
 def _apply_etazhi(tariff, text):
+    t = text.strip().lower()
+    tj = tariff.setdefault("tariff_json", {})
+    if t in _EMPTY_VALUES:
+        tj["etazhi_stavka"] = None
+        return
     v = _parse_one_number(text)
     if v < 20 or v > 100:
         raise ValueError(f"{_fmt_num(v)} не похоже на этаж (обычно 20-100 грн: 20-30 для 1-10 этажа, до 100 выше) - проверьте цифру")
-    tj = tariff.setdefault("tariff_json", {})
     tj["etazhi_stavka"] = v
     _resolve_neponyatno(tariff, v)
 
 
 def _apply_prohody(tariff, text):
+    t = text.strip().lower()
+    tj = tariff.setdefault("tariff_json", {})
+    if t in _EMPTY_VALUES:
+        tj["prohody_stavka"] = None
+        return
     v = _parse_one_number(text)
     if v < 20 or v > 50:
         raise ValueError(f"{_fmt_num(v)} не похоже на проход/допу (обычно 20-30 без весовых предметов, до 50 с ними) - проверьте цифру")
-    tj = tariff.setdefault("tariff_json", {})
     tj["prohody_stavka"] = v
     _resolve_neponyatno(tariff, v)
 
 
 def _apply_ves(tariff, text):
+    t = text.strip().lower()
+    tj = tariff.setdefault("tariff_json", {})
+    if t in _EMPTY_VALUES:
+        tj["ves"] = None
+        return
     v = _parse_one_number(text)
     if v > 15:
         raise ValueError(f"{_fmt_num(v)} многовато для веса (обычно до 15 грн/кг) - проверьте цифру")
-    tj = tariff.setdefault("tariff_json", {})
     tj["ves"] = {"tip": "ploskaya", "stavka": v}
     _resolve_neponyatno(tariff, v)
 
