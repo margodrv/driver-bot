@@ -1019,6 +1019,39 @@ def _strip_client_pays_from_kom(result: dict, order_text: str):
         result["kom_avto"] = dict(kg) if kg else None
 
 
+def _strip_bogus_dop_tochka_without_word(result: dict, order_text: str):
+    """Реальный кейс (13.08): текст вообще не содержал слова 'точка' -
+    только "5Т+ гідроборт+ рокла+ 3 вантажники" в описании авто и число
+    500 в тарифе без единого пояснения. GPT всё равно сочинил
+    "Доп.точка: +500 грн", хотя рядом лежит куда более вероятный
+    кандидат - "рокла", явно упомянутая в тексте, просто без отдельной
+    цены. Если слова 'точка' в тексте нет вообще - число явно не про
+    доп.точку:
+    - если "рокла" упомянута - переносим число туда (более вероятный
+      кандидат, чем ничем не подтверждённая "точка")
+    - если и рокла не упомянута - просто убираем в neponyatno, не
+      теряя число молча
+    """
+    tj = result.get("tariff_json") or {}
+    dt = tj.get("dop_tochka")
+    if not dt or dt.get("summa") is None:
+        return
+    text_low = (order_text or "").lower()
+    if "точк" in text_low or re.search(r"\bт3\b", text_low, re.IGNORECASE):
+        return  # слово/маркер реально есть в тексте - не наша защита, оставляем как есть
+
+    val = dt["summa"]
+    tj["dop_tochka"] = None
+    if "рокла" in text_low:
+        prochie = [d for d in (tj.get("prochie_dopy") or []) if (d.get("nazvanie") or "").strip().lower() != "рокла"]
+        prochie.append({"nazvanie": "Рокла", "summa": val, "group": "avto"})
+        tj["prochie_dopy"] = prochie
+    else:
+        neponyatno = list(result.get("neponyatno") or [])
+        neponyatno.append(f"{_fmt_num(val)}: ГБ?/км?")
+        result["neponyatno"] = neponyatno
+
+
 def _strip_duplicate_dop_tochka_km(result: dict, order_text: str):
     """Реальный кейс (15.08): текст содержал только 'Км 500' (без слова
     'точка' вообще), а GPT ЗАОДНО сочинил доп.точку с той же суммой 500 -
@@ -1252,6 +1285,7 @@ def parse_tariff_via_gpt(order_text: str) -> dict:
         _strip_client_pays_from_kom(result, order_text)
         result["neponyatno"] = _filter_neponyatno(result)
         _strip_bogus_gidrobort(result)
+        _strip_bogus_dop_tochka_without_word(result, order_text)
         _strip_duplicate_dop_tochka_km(result, order_text)
         _strip_implausible_dop_tochka(result)
         _strip_implausible_gidrobort(result)
@@ -1346,8 +1380,13 @@ def build_tariff_preview(tariff: dict, author_line: str = "", edited_fields: set
     elif g_str:
         lines.append(f"Ком. грузчики: {g_str}{kom_star}")
 
-    if tariff.get("platelshik"):
-        lines.append(f"Плательщик: {tariff['platelshik']}{star(['platelshik'])}")
+    # Плательщик показываем ТОЛЬКО когда это реально важно: БН + платит
+    # Диспетчер. Если БН, но платит Клиент (или не указано) - логист всё
+    # равно сам выставляет счёт, разницы для него нет, строку не
+    # показываем, чтобы не грузить превью неважной информацией. При Нал
+    # плательщик вообще не имеет значения.
+    if tariff.get("forma_oplaty") == "БН" and tariff.get("platelshik") == "Диспетчер":
+        lines.append(f"Плательщик: Диспетчер{star(['platelshik'])}")
 
     if tariff.get("forma_oplaty"):
         lines.append(f"Форма оплаты: {tariff['forma_oplaty']}{star(['forma_oplaty', 'platelshik'])}")
