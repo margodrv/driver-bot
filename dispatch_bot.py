@@ -488,6 +488,13 @@ _TARIFF_SYSTEM_PROMPT = """\
   nazvanie "Допы с весом", summa=X, group "gruzchiki". НЕ путай с самим
   полем "ves" (ves - это ставка за кг, например "від 160кг по 8грн/кг" -
   разные вещи, могут встречаться в одном заказе одновременно).
+- "клієнт платить X"/"клиент платит X" (сумма, которую в итоге платит
+  клиент) - это ИНФОРМАЦИОННАЯ пометка, НИКОГДА не комиссия. Комиссия
+  заполняется ТОЛЬКО от явного слова "ком"/"коміс"/"комісія" рядом с
+  числом - если рядом с "клієнт платить" нет слова "ком", не путай эту
+  сумму с kom_avto/kom_gruzchiki, даже если больше никакой другой суммы
+  для комиссии не видно - оставь комиссию null или бери только из
+  реальной строки "Ком X%"/"Ком X".
 - Комиссия может состоять из нескольких чисел (например "900/100/8" -
   база/точка/км) - раскладывай так же по ключевым словам рядом, аналогично
   правилу выше.
@@ -986,6 +993,32 @@ def _is_plausible_gidrobort(v) -> bool:
     return 200 <= v <= 800 and v % 50 == 0
 
 
+_RE_CLIENT_PAYS_AMOUNT = re.compile(r"кл[іи][єе]нт\w*[ \t]*плат\w*[ \t]*(\d+(?:[.,]\d+)?)", re.IGNORECASE)
+
+
+def _strip_client_pays_from_kom(result: dict, order_text: str):
+    """Реальный кейс (15.08): текст содержал '...клиент платит 4900 грн'
+    (информационная пометка - сколько всего платит клиент, ни разу не
+    комиссия) РЯДОМ с настоящей комиссией 'ком 10%' дальше по тексту.
+    GPT перепутал и записал 4900 как kom_avto, хотя реальная (и
+    единственная) комиссия в заказе - 10% на всё.
+
+    Если сумма kom_avto совпадает с числом из фразы 'клієнт/клиент
+    платить/платит X' - это не комиссия, убираем. Если при этом у
+    kom_gruzchiki есть настоящее значение (обычно % - как в этом кейсе)
+    - копируем его в kom_avto тоже, раз изначально это была ОДНА общая
+    комиссия на весь заказ, а не раздельная для авто/грузчиков.
+    """
+    m = _RE_CLIENT_PAYS_AMOUNT.search(order_text or "")
+    if not m:
+        return
+    amount = float(m.group(1).replace(",", "."))
+    ka = result.get("kom_avto")
+    if ka and ka.get("tip") == "сумма" and ka.get("znachenie") == amount:
+        kg = result.get("kom_gruzchiki")
+        result["kom_avto"] = dict(kg) if kg else None
+
+
 def _strip_duplicate_dop_tochka_km(result: dict, order_text: str):
     """Реальный кейс (15.08): текст содержал только 'Км 500' (без слова
     'точка' вообще), а GPT ЗАОДНО сочинил доп.точку с той же суммой 500 -
@@ -1216,6 +1249,7 @@ def parse_tariff_via_gpt(order_text: str) -> dict:
         _recover_avto_dop_chas(result, order_text)
         _strip_bogus_gruzchiki(result, order_text)
         _strip_bogus_kom(result, order_text)
+        _strip_client_pays_from_kom(result, order_text)
         result["neponyatno"] = _filter_neponyatno(result)
         _strip_bogus_gidrobort(result)
         _strip_duplicate_dop_tochka_km(result, order_text)
