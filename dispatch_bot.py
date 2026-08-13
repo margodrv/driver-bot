@@ -1312,6 +1312,15 @@ def parse_tariff_via_gpt(order_text: str) -> dict:
         raw = completion.choices[0].message.content.strip()
         raw = re.sub(r"^```json\s*|\s*```$", "", raw.strip())
         result = json.loads(raw)
+        if result.get("tariff_json") is None:
+            # GPT иногда возвращает явный null вместо пустого объекта {} -
+            # setdefault() это НЕ ловит (он не трогает существующий ключ,
+            # даже если его значение None), из-за чего вся последующая
+            # цепочка _strip_*/_apply_* падала с 'NoneType' has no
+            # attribute get и весь тариф терялся. Нормализуем сразу.
+            result["tariff_json"] = {}
+        if result.get("neponyatno") is None:
+            result["neponyatno"] = []
         _apply_vitaliya_sanobrobka_template(result, order_text)
         _apply_avto_gruzchiki_multiline_template(result, order_text)
         _apply_keyword_overrides(result, order_text)
