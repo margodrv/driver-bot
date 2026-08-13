@@ -1227,6 +1227,35 @@ def _reconcile_neponyatno(result: dict):
     _strip_ves_when_gruzchiki(result)
 
 
+def _split_gruzchiki_dopy_by_plausibility(result: dict):
+    """Подтверждено: число ≤15 среди 'лишних' чисел грузчиков (например
+    '1600/800/4/20' - 4 и 20 сверх базы/доп.часа) может быть ТОЛЬКО
+    весом - другие категории (этаж/проход/км/рокла) никогда не бывают
+    такими маленькими. Такие числа классифицируются в вес автоматически,
+    без вопроса.
+
+    Числа больше 15 (например тот же '20') неоднозначны - могут быть
+    этажом/проходом/км - НЕ угадываем, а переносим в явное предупреждение
+    "не понял" с кандидатами, чтобы логист мог решить одним нажатием
+    кнопки (а не искать глазами в строке 'Грузчики: .../20').
+    """
+    dopy = result.get("gruzchiki_dopy") or []
+    if not dopy:
+        return
+    tj = result.setdefault("tariff_json", {})
+    remaining = []
+    neponyatno = list(result.get("neponyatno") or [])
+    for val in dopy:
+        if val <= 15 and not tj.get("ves"):
+            tj["ves"] = {"tip": "ploskaya", "stavka": val}
+        elif val <= 15:
+            remaining.append(val)  # вес уже занят другим числом - редкий случай, оставляем как есть
+        else:
+            neponyatno.append(f"{_fmt_num(val)}: этаж?/проход?/км?")
+    result["gruzchiki_dopy"] = remaining
+    result["neponyatno"] = neponyatno
+
+
 def _apply_hodka_context_to_dop_tochka(result: dict, order_text: str):
     """Подтверждено: слово 'ходка'/'ходки' в тексте (даже не рядом с
     самим числом - например "(три ходки)" в описании точки маршрута,
@@ -1338,6 +1367,7 @@ def parse_tariff_via_gpt(order_text: str) -> dict:
         _normalize_forma_oplaty(result)
         _reconcile_neponyatno(result)
         _apply_hodka_context_to_dop_tochka(result, order_text)
+        _split_gruzchiki_dopy_by_plausibility(result)
         return result
     except Exception as e:
         logger.error(f"Ошибка разбора тарифа через GPT: {e}")
@@ -1769,6 +1799,17 @@ def _apply_km(tariff, text):
     _resolve_neponyatno(tariff, v)
 
 
+def _remove_from_gruzchiki_dopy(tariff, value):
+    """Если число только что классифицировали вручную (Вес/Этажи/Проход),
+    а оно всё ещё сидит в сыром списке gruzchiki_dopy (куда попадает по
+    умолчанию, пока не классифицировано) - убираем оттуда. Иначе число
+    показывается ДВАЖДЫ: и в строке 'Грузчики: .../4/20', и отдельной
+    строкой 'Вес'/'Этажи' (реальный кейс 14.08)."""
+    dopy = tariff.get("gruzchiki_dopy") or []
+    if value in dopy:
+        tariff["gruzchiki_dopy"] = [d for d in dopy if d != value]
+
+
 def _apply_etazhi(tariff, text):
     t = text.strip().lower()
     tj = tariff.setdefault("tariff_json", {})
@@ -1780,6 +1821,7 @@ def _apply_etazhi(tariff, text):
         raise ValueError(f"{_fmt_num(v)} не похоже на этаж (обычно 20-100 грн: 20-30 для 1-10 этажа, до 100 выше) - проверьте цифру")
     tj["etazhi_stavka"] = v
     _resolve_neponyatno(tariff, v)
+    _remove_from_gruzchiki_dopy(tariff, v)
 
 
 def _apply_prohody(tariff, text):
@@ -1793,6 +1835,7 @@ def _apply_prohody(tariff, text):
         raise ValueError(f"{_fmt_num(v)} не похоже на проход/допу (обычно 20-30 без весовых предметов, до 50 с ними) - проверьте цифру")
     tj["prohody_stavka"] = v
     _resolve_neponyatno(tariff, v)
+    _remove_from_gruzchiki_dopy(tariff, v)
 
 
 def _apply_ves(tariff, text):
@@ -1806,6 +1849,7 @@ def _apply_ves(tariff, text):
         raise ValueError(f"{_fmt_num(v)} многовато для веса (обычно до 15 грн/кг) - проверьте цифру")
     tj["ves"] = {"tip": "ploskaya", "stavka": v}
     _resolve_neponyatno(tariff, v)
+    _remove_from_gruzchiki_dopy(tariff, v)
 
 
 def _apply_rokla(tariff, text):
