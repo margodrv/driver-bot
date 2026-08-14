@@ -632,6 +632,30 @@ _FIVE_NUMBERS_RE = re.compile(
 )
 
 
+_RE_SHARED_TARIFF_HOURS = re.compile(r"тариф[ \t]*на[ \t]*(\d+(?:[.,]\d+)?)[ \t]*ч", re.IGNORECASE)
+
+
+def _apply_shared_tariff_hours(result: dict, order_text: str):
+    """Подтверждено: если в тексте есть общий заголовок "Тариф на Xч"
+    ПЕРЕД строками и авто, и грузчиков - это относится к обоим сразу, а
+    не только к авто. Раньше грузчики всегда получали дефолтные 2ч
+    (бизнес-правило по умолчанию), даже если в тексте явно указано
+    другое общее число часов.
+
+    Применяется только если это число ещё не определено более конкретно
+    (например явным "Хч" рядом именно с авто/грузчиками отдельно) - не
+    переопределяем более точную информацию, если она уже есть.
+    """
+    m = _RE_SHARED_TARIFF_HOURS.search(order_text or "")
+    if not m:
+        return
+    hours = float(m.group(1).replace(",", "."))
+    if result.get("avto_baza") is not None and result.get("min_chasov") is None:
+        result["min_chasov"] = hours
+    if result.get("gruzchiki_baza") is not None and result.get("gruzchiki_chasov") is None:
+        result["gruzchiki_chasov"] = hours
+
+
 def _recover_avto_dop_chas(result: dict, order_text: str):
     """Страховка: если GPT нашёл avto_baza, но НЕ нашёл avto_dop_chas
     (осталось null) - пробуем достать его напрямую регэкспом из текста.
@@ -681,7 +705,7 @@ _RE_KOM_PERCENT = re.compile(r"ком[ \t]*(\d+(?:[.,]\d+)?)[ \t]*%", re.IGNOREC
 _RE_ROKLA_GENERAL = re.compile(
     r"(?:рокла[ \t]*(\d+(?:[.,]\d+)?))|(?:(\d+(?:[.,]\d+)?)[ \t]*рокла)", re.IGNORECASE
 )
-_RE_KM_GENERAL = re.compile(r"(\d+(?:[.,]\d+)?)[ \t]*грн[ \t]*/[ \t]*км", re.IGNORECASE)
+_RE_KM_GENERAL = re.compile(r"(\d+(?:[.,]\d+)?)[ \t]*грн[ \t]*/?[ \t]*км", re.IGNORECASE)
 _RE_VES_THRESHOLD_GENERAL = re.compile(
     r"ваг\w*[ \t]*від[ \t]*(\d+(?:[.,]\d+)?)[ \t]*по[ \t]*(\d+(?:[.,]\d+)?)[ \t]*грн[ \t]*/[ \t]*кг", re.IGNORECASE
 )
@@ -692,6 +716,9 @@ _RE_PROHOD_ETAZH_COMBINED = re.compile(
 )
 _RE_ETAZH_GENERAL = re.compile(
     r"(?:поверх[ \t]*(\d+(?:[.,]\d+)?))|(?:(\d+(?:[.,]\d+)?)[ \t]*поверх)", re.IGNORECASE
+)
+_RE_NICHNI_GENERAL = re.compile(
+    r"(?:нічн\w*[ \t]*(\d+(?:[.,]\d+)?))|(?:(\d+(?:[.,]\d+)?)[ \t]*нічн\w*)", re.IGNORECASE
 )
 
 
@@ -775,6 +802,13 @@ def _apply_keyword_overrides(result: dict, order_text: str):
                 tj["etazhi_stavka"] = val
                 if (tj.get("dop_tochka") or {}).get("summa") == val:
                     tj["dop_tochka"] = None
+
+    m = _RE_NICHNI_GENERAL.search(order_text or "")
+    if m:
+        val = float((m.group(1) or m.group(2)).replace(",", "."))
+        prochie = [d for d in (tj.get("prochie_dopy") or []) if (d.get("nazvanie") or "").strip().lower() != "нічний тариф"]
+        prochie.append({"nazvanie": "Нічний тариф", "summa": val, "group": "avto"})
+        tj["prochie_dopy"] = prochie
 
 
 def _apply_avto_gruzchiki_multiline_template(result: dict, order_text: str):
@@ -895,6 +929,7 @@ def _apply_vitaliya_sanobrobka_template(result: dict, order_text: str):
     tj = result.setdefault("tariff_json", {})
     tj["dop_tochka"] = {"tip": "doplata_fix", "summa": tochka}
     tj["km_stavka"] = km
+    result["_km_trusted"] = True
     prochie = [d for d in (tj.get("prochie_dopy") or []) if (d.get("nazvanie") or "").strip().lower() != "санобробка"]
     prochie.append({"nazvanie": "Санобробка", "summa": san})
     tj["prochie_dopy"] = prochie
@@ -909,6 +944,69 @@ def _apply_vitaliya_sanobrobka_template(result: dict, order_text: str):
             continue
         kept.append(item)
     result["neponyatno"] = kept
+
+
+_RE_VITALIYA_GRUZCHIKI_TEMPLATE = re.compile(
+    r"авто[ \t]*(\d+(?:[.,]\d+)?)[ \t]*/[ \t]*(\d+(?:[.,]\d+)?)[ \t]*"
+    r"груз\w*[ \t]*(\d+(?:[.,]\d+)?)[ \t]*/[ \t]*(\d+(?:[.,]\d+)?)[ \t]*/"
+    r"[ \t]*(\d+(?:[.,]\d+)?)[ \t]*/[ \t]*(\d+(?:[.,]\d+)?)[ \t]*/[ \t]*(\d+(?:[.,]\d+)?)",
+    re.IGNORECASE,
+)
+
+
+def _apply_vitaliya_gruzchiki_template(result: dict, order_text: str):
+    """Второй подтверждённый шаблон источника 'Виталия' (отличается от
+    санобработки выше): "Тар БН Авто X/Y грузчики A/B/C/D/E" - семь
+    чисел с ЖЁСТКО фиксированным порядком:
+    X=авто база, Y=авто доп.час, A=грузчики база, B=грузчики доп.час,
+    C=этаж, D=проход, E=вес.
+
+    Плюс подтверждено отдельное правило: для БН-заказов от Виталии
+    комиссия ВСЕГДА 0% - это партнёрский тариф, по которому Виталия уже
+    платит нам напрямую, комиссии сверху нет. Не полагаемся на GPT для
+    этого шаблона вообще - переопределяем детерминированно кодом.
+
+    Применяется ТОЛЬКО если "виталия" в тексте есть И формат ровно
+    совпал с этими семью числами в этом порядке.
+    """
+    if not _VITALIYA_RE.search(order_text or ""):
+        return
+    m = _RE_VITALIYA_GRUZCHIKI_TEMPLATE.search(order_text or "")
+    if not m:
+        return  # формат не совпал - не рискуем, оставляем как разобрал GPT
+
+    avto_baza, avto_dop, gr_baza, gr_dop, etazh, prohod, ves = (
+        float(g.replace(",", ".")) for g in m.groups()
+    )
+
+    result["avto_baza"] = avto_baza
+    result["avto_dop_chas"] = avto_dop
+    result["tip_rascheta"] = "почасовка"
+    result["gruzchiki_baza"] = gr_baza
+    result["gruzchiki_dop_chas"] = gr_dop
+    result["gruzchiki_dopy"] = []
+
+    tj = result.setdefault("tariff_json", {})
+    tj["etazhi_stavka"] = etazh
+    tj["prohody_stavka"] = prohod
+    tj["ves"] = {"tip": "ploskaya", "stavka": ves}
+    result["_etazhi_prohody_trusted"] = True
+    result["_ves_trusted"] = True
+    # Гідроборт/рокла упомянуты в тексте только как характеристики авто
+    # без отдельной цены - остаются НЕ заполненными (уже включены в
+    # тариф), это уже покрыто стандартной логикой парсинга.
+
+    if _FORMA_BN_RE.search(order_text or ""):
+        result["forma_oplaty"] = "БН"
+        result["kom_avto"] = {"znachenie": 0, "tip": "%"}
+        result["kom_gruzchiki"] = None
+
+    # Все числа этого шаблона классифицированы детерминированно.
+    used = {_fmt_num(n) for n in (avto_baza, avto_dop, gr_baza, gr_dop, etazh, prohod, ves)}
+    result["neponyatno"] = [
+        item for item in (result.get("neponyatno") or [])
+        if not (m2 := _NEPONYATNO_ITEM_RE.match(item)) or m2.group(1) not in used
+    ]
 
 
 def _strip_bogus_gruzchiki(result: dict, order_text: str):
@@ -994,6 +1092,45 @@ def _is_plausible_gidrobort(v) -> bool:
 
 
 _RE_CLIENT_PAYS_AMOUNT = re.compile(r"кл[іи][єе]нт\w*[ \t]*плат\w*[ \t]*(\d+(?:[.,]\d+)?)", re.IGNORECASE)
+
+
+_KM_WORD_RE = re.compile(r"км|кілометр|километр", re.IGNORECASE)
+
+
+def _strip_bogus_km(result: dict, order_text: str):
+    """Реальный кейс (14.08): текст не содержал слова 'км' вообще ни в
+    каком виде, а GPT всё равно выдумал 'Км: 400 грн/км', продублировав
+    число, которое уже честно использовано как avto_dop_chas. Если слова
+    'км'/'кілометр' в тексте нет вообще - km_stavka не может быть
+    заполнен, это фантазия. Убираем; если число нигде больше не учтено -
+    переносим в 'не понял' для ручного разбора, а если оно и так уже
+    где-то классифицировано (например, оказалось той же цифрой, что и
+    доп.час, или уже стало именной допой) - просто убираем, не
+    переспрашиваем то, что и так уже видно в превью.
+
+    ИСКЛЮЧЕНИЕ: доверенные детерминированные шаблоны (флаг
+    '_km_trusted' - см. _apply_vitaliya_sanobrobka_template, где км
+    определяется по позиции числа в шаблоне, а не по слову рядом) не
+    трогаем."""
+    if result.pop("_km_trusted", False):
+        return
+    tj = result.get("tariff_json") or {}
+    km = tj.get("km_stavka")
+    if km is None:
+        return
+    if _KM_WORD_RE.search(order_text or ""):
+        return
+
+    tj["km_stavka"] = None
+    already_used = {result.get("avto_baza"), result.get("avto_dop_chas"),
+                     result.get("gruzchiki_baza"), result.get("gruzchiki_dop_chas")}
+    already_used |= {d.get("summa") for d in (tj.get("prochie_dopy") or [])}
+    if km in already_used:
+        return  # число и так уже видно в превью под другим названием - не переспрашиваем повторно
+
+    neponyatno = list(result.get("neponyatno") or [])
+    neponyatno.append(f"{_fmt_num(km)}: ГБ?/точка?")
+    result["neponyatno"] = neponyatno
 
 
 def _strip_client_pays_from_kom(result: dict, order_text: str):
@@ -1121,7 +1258,14 @@ def _strip_implausible_etazhi_prohody(result: dict):
     несёт информации, показывать его как предупреждение бессмысленно).
     Убираем значения вне правдоподобного диапазона молча, без переноса
     в neponyatno - в отличие от доп.точки/ГБ, тут восстанавливать
-    нечего, это просто мусор."""
+    нечего, это просто мусор.
+
+    ИСКЛЮЧЕНИЕ: если значения пришли из доверенного детерминированного
+    шаблона (флаг '_etazhi_prohody_trusted' - см.
+    _apply_vitaliya_gruzchiki_template, где этаж/проход реально бывают
+    меньше обычного диапазона, например 10) - не трогаем вообще."""
+    if result.pop("_etazhi_prohody_trusted", False):
+        return
     tj = result.setdefault("tariff_json", {})
     for key, (lo, hi) in (("etazhi_stavka", (20, 100)), ("prohody_stavka", (20, 50))):
         v = tj.get(key)
@@ -1256,6 +1400,76 @@ def _split_gruzchiki_dopy_by_plausibility(result: dict):
     result["neponyatno"] = neponyatno
 
 
+_RE_TAR_NUMBERS = re.compile(
+    r"тар(?:иф)?[:\s]*(\d+(?:[.,]\d+)?)(?=[ \t]*(?:/|грн|\s|$))(?:[ \t]*/[ \t]*(\d+(?:[.,]\d+)?))?",
+    re.IGNORECASE,
+)
+
+
+def _recover_avto_baza_from_tar_line(result: dict, order_text: str):
+    """Реальный кейс (14.08): текст начинался с "Авто від 4,2" (это
+    СПЕЦИФИКАЦИЯ длины кузова - 4.2 метра, не тариф!), а дальше шёл
+    настоящий тариф "Тар 1500/500/150пром точка". GPT спутал "4,2" (метры)
+    с суммой и выдумал avto_baza=4200 из ниоткуда, полностью
+    проигнорировав реальную строку тарифа.
+
+    Число сразу после слова "Тар"/"Тариф" - во ВСЕХ примерах в этом
+    боте всегда оказывалось настоящей базой авто, без исключений.
+    Финальная проверка: если оно не совпадает с тем, что определил GPT -
+    берём число из "Тар"-строки как более авторитетное, переопределяем.
+    Запускается ПОСЛЕДНИМ в цепочке - все детерминированные шаблоны уже
+    успели сработать своей более точной логикой (если она была нужна),
+    так что для них это просто ничего не изменит (числа и так совпадут).
+    """
+    m = _RE_TAR_NUMBERS.search(order_text or "")
+    if not m:
+        return
+    tar_baza = float(m.group(1).replace(",", "."))
+    if result.get("avto_baza") == tar_baza:
+        return  # уже совпадает - нечего чинить
+
+    result["avto_baza"] = tar_baza
+    if m.group(2):
+        result["avto_dop_chas"] = float(m.group(2).replace(",", "."))
+        result["tip_rascheta"] = "почасовка"
+    elif result.get("tip_rascheta") != "фикс":
+        # После "Тар" всего одно число без "/" - похоже на фикс, но не
+        # трогаем avto_dop_chas принудительно, если GPT его откуда-то
+        # уже корректно нашёл (например третьим числом чуть дальше) -
+        # переопределяем тип расчёта только если он ещё не определён.
+        pass
+
+
+def _dedupe_neponyatno_by_number(result: dict):
+    """Последняя защита от дублей: одно и то же число иногда попадает в
+    'не понял' из разных источников (GPT сам плюс наши защитные функции),
+    создавая два отдельных предупреждения на одно число (реальный кейс:
+    '50: км?' и '50: ГБ?/км?' одновременно). Объединяем по числу,
+    сохраняя union кандидатов."""
+    merged = {}
+    order = []
+    for item in result.get("neponyatno") or []:
+        m = _NEPONYATNO_ITEM_RE.match(item)
+        if not m:
+            order.append((None, item))
+            continue
+        num_str, cands_str = m.groups()
+        cands = [c.strip() for c in cands_str.split("/") if c.strip()]
+        if num_str in merged:
+            existing = merged[num_str]
+            for c in cands:
+                if c.lower() not in [e.lower() for e in existing]:
+                    existing.append(c)
+        else:
+            merged[num_str] = cands
+            order.append((num_str, None))
+
+    result["neponyatno"] = [
+        item if num_str is None else f"{num_str}: " + "/".join(merged[num_str])
+        for num_str, item in order
+    ]
+
+
 def _apply_hodka_context_to_dop_tochka(result: dict, order_text: str):
     """Подтверждено: слово 'ходка'/'ходки' в тексте (даже не рядом с
     самим числом - например "(три ходки)" в описании точки маршрута,
@@ -1351,12 +1565,15 @@ def parse_tariff_via_gpt(order_text: str) -> dict:
         if result.get("neponyatno") is None:
             result["neponyatno"] = []
         _apply_vitaliya_sanobrobka_template(result, order_text)
+        _apply_vitaliya_gruzchiki_template(result, order_text)
         _apply_avto_gruzchiki_multiline_template(result, order_text)
         _apply_keyword_overrides(result, order_text)
         _recover_avto_dop_chas(result, order_text)
+        _apply_shared_tariff_hours(result, order_text)
         _strip_bogus_gruzchiki(result, order_text)
         _strip_bogus_kom(result, order_text)
         _strip_client_pays_from_kom(result, order_text)
+        _strip_bogus_km(result, order_text)
         result["neponyatno"] = _filter_neponyatno(result)
         _strip_bogus_gidrobort(result)
         _strip_bogus_dop_tochka_without_word(result, order_text)
@@ -1368,6 +1585,8 @@ def parse_tariff_via_gpt(order_text: str) -> dict:
         _reconcile_neponyatno(result)
         _apply_hodka_context_to_dop_tochka(result, order_text)
         _split_gruzchiki_dopy_by_plausibility(result)
+        _recover_avto_baza_from_tar_line(result, order_text)
+        _dedupe_neponyatno_by_number(result)
         return result
     except Exception as e:
         logger.error(f"Ошибка разбора тарифа через GPT: {e}")
