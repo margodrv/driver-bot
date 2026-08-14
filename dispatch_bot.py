@@ -635,6 +635,27 @@ _FIVE_NUMBERS_RE = re.compile(
 _RE_SHARED_TARIFF_HOURS = re.compile(r"тариф[ \t]*на[ \t]*(\d+(?:[.,]\d+)?)[ \t]*ч", re.IGNORECASE)
 
 
+_RE_KOM_WITH_GRN = re.compile(r"ком[:\s]*\d+(?:[.,]\d+)?[ \t]*грн", re.IGNORECASE)
+
+
+def _reclassify_small_kom_as_percent(result: dict, order_text: str):
+    """Подтверждено: "Ком 10" (голое число, без %) при небольшом значении
+    (например ≤50) - это почти всегда проценты, а не гривны. Реальный
+    кейс: "Ком 10" на заказе с тарифом 5400+ - GPT классифицировал как
+    "10 грн" (сумма), хотя это явно 10%, комиссия в гривнах такого
+    размера была бы абсурдно мала.
+
+    НЕ трогаем, если рядом со словом "ком" в тексте явно написано "грн" -
+    тогда это точно сумма, сомнений нет.
+    """
+    if _RE_KOM_WITH_GRN.search(order_text or ""):
+        return
+    for key in ("kom_avto", "kom_gruzchiki"):
+        k = result.get(key)
+        if k and k.get("tip") == "сумма" and k.get("znachenie") is not None and k["znachenie"] <= 50:
+            k["tip"] = "%"
+
+
 def _apply_shared_tariff_hours(result: dict, order_text: str):
     """Подтверждено: если в тексте есть общий заголовок "Тариф на Xч"
     ПЕРЕД строками и авто, и грузчиков - это относится к обоим сразу, а
@@ -806,8 +827,8 @@ def _apply_keyword_overrides(result: dict, order_text: str):
     m = _RE_NICHNI_GENERAL.search(order_text or "")
     if m:
         val = float((m.group(1) or m.group(2)).replace(",", "."))
-        prochie = [d for d in (tj.get("prochie_dopy") or []) if (d.get("nazvanie") or "").strip().lower() != "нічний тариф"]
-        prochie.append({"nazvanie": "Нічний тариф", "summa": val, "group": "avto"})
+        prochie = [d for d in (tj.get("prochie_dopy") or []) if (d.get("nazvanie") or "").strip().lower() != "нічне зберігання"]
+        prochie.append({"nazvanie": "Нічне зберігання", "summa": val, "group": "avto"})
         tj["prochie_dopy"] = prochie
 
 
@@ -952,6 +973,63 @@ _RE_VITALIYA_GRUZCHIKI_TEMPLATE = re.compile(
     r"[ \t]*(\d+(?:[.,]\d+)?)[ \t]*/[ \t]*(\d+(?:[.,]\d+)?)[ \t]*/[ \t]*(\d+(?:[.,]\d+)?)",
     re.IGNORECASE,
 )
+
+
+_RE_COMBINED_TARIFF_MARKER = re.compile(
+    r"тар[ \t]*бн[ \t]*(\d+(?:[.,]\d+)?)[ \t]*/[ \t]*(\d+(?:[.,]\d+)?)[ \t]*/[ \t]*допи[ \t]*по[ \t]*(\d+(?:[.,]\d+)?)[ \t]*грн",
+    re.IGNORECASE,
+)
+_RE_VAGA_PO = re.compile(r"ваг\w*[ \t]*по[ \t]*(\d+(?:[.,]\d+)?)[ \t]*грн", re.IGNORECASE)
+_RE_KM_PO = re.compile(r"км[ \t]*по[ \t]*(\d+(?:[.,]\d+)?)[ \t]*грн", re.IGNORECASE)
+_RE_LOADER_COUNT_PLUS = re.compile(r"(\d+)[ \t]*(?:вантажник\w*|грузчик\w*)", re.IGNORECASE)
+
+
+def _apply_combined_avto_gruzchiki_template(result: dict, order_text: str):
+    """Новая категория (15.08, пока один подтверждённый пример - если
+    формулировка встретится ещё раз в другом виде, может понадобиться
+    расширить триггер): "Тар БН база/доп_час/допи по Xгрн" БЕЗ отдельной
+    строки тарифа грузчиков - база и доп.час относятся к АВТО+ГРУЗЧИКАМ
+    ВМЕСТЕ как единой услуге, не раздельно.
+
+    Отличие от обычного случая: НЕ создаём отдельную строку "Грузчики" -
+    показываем один общий "Авто+N грузчика: база (Xч)/доп_час".
+
+    "допи по Xгрн" - общая ставка на этажи/проходы (обе категории сразу,
+    как и в правиле "Прохід/поверх" ранее). "вага по Xгрн" и "км по
+    Xгрн" - вес и километраж, если упомянуты.
+    """
+    m = _RE_COMBINED_TARIFF_MARKER.search(order_text or "")
+    if not m:
+        return
+
+    baza, dop, dopy = (float(g.replace(",", ".")) for g in m.groups())
+
+    result["avto_baza"] = baza
+    result["avto_dop_chas"] = dop
+    result["tip_rascheta"] = "почасовка"
+    result["gruzchiki_baza"] = None
+    result["gruzchiki_dop_chas"] = None
+    result["gruzchiki_dopy"] = []
+
+    tj = result.setdefault("tariff_json", {})
+    tj["etazhi_stavka"] = dopy
+    tj["prohody_stavka"] = dopy
+    result["_etazhi_prohody_trusted"] = True
+
+    m2 = _RE_VAGA_PO.search(order_text or "")
+    if m2:
+        tj["ves"] = {"tip": "ploskaya", "stavka": float(m2.group(1).replace(",", "."))}
+        result["_ves_trusted"] = True
+
+    m3 = _RE_KM_PO.search(order_text or "")
+    if m3:
+        tj["km_stavka"] = float(m3.group(1).replace(",", "."))
+        result["_km_trusted"] = True
+
+    lc = _RE_LOADER_COUNT_PLUS.search(order_text or "")
+    result["_combined_avto_label"] = f"Авто+{lc.group(1)} грузчика" if lc else "Авто+грузчики"
+
+    result["neponyatno"] = []
 
 
 def _apply_vitaliya_gruzchiki_template(result: dict, order_text: str):
@@ -1566,10 +1644,12 @@ def parse_tariff_via_gpt(order_text: str) -> dict:
             result["neponyatno"] = []
         _apply_vitaliya_sanobrobka_template(result, order_text)
         _apply_vitaliya_gruzchiki_template(result, order_text)
+        _apply_combined_avto_gruzchiki_template(result, order_text)
         _apply_avto_gruzchiki_multiline_template(result, order_text)
         _apply_keyword_overrides(result, order_text)
         _recover_avto_dop_chas(result, order_text)
         _apply_shared_tariff_hours(result, order_text)
+        _reclassify_small_kom_as_percent(result, order_text)
         _strip_bogus_gruzchiki(result, order_text)
         _strip_bogus_kom(result, order_text)
         _strip_client_pays_from_kom(result, order_text)
@@ -1616,14 +1696,15 @@ def build_tariff_preview(tariff: dict, author_line: str = "", edited_fields: set
 
     # --- Блок "Авто": сама ставка + все доп.начисления, привязанные к
     # авто (доп.точка/гідроборт/доп.ходка/км/именные допы группы avto) ---
+    avto_label = tariff.get("_combined_avto_label") or "Авто"
     base = tariff.get("avto_baza")
     if tariff.get("tip_rascheta") == "фикс":
-        lines.append(f"Авто: {_fmt_num(base)} (фикса){star(['avto_baza', 'avto_dop_chas', 'min_chasov'])}")
+        lines.append(f"{avto_label}: {_fmt_num(base)} (фикса){star(['avto_baza', 'avto_dop_chas', 'min_chasov'])}")
     elif base is not None:
         min_h = tariff.get("min_chasov")
         dop = _fmt_num(tariff.get("avto_dop_chas"))
         hours_part = f" ({_fmt_num(min_h)}ч)" if min_h is not None else ""
-        lines.append(f"Авто: {_fmt_num(base)}{hours_part}/{dop}{star(['avto_baza', 'avto_dop_chas', 'min_chasov'])}")
+        lines.append(f"{avto_label}: {_fmt_num(base)}{hours_part}/{dop}{star(['avto_baza', 'avto_dop_chas', 'min_chasov'])}")
 
     dt = tj.get("dop_tochka")
     if dt:
