@@ -730,6 +730,9 @@ _RE_KM_GENERAL = re.compile(r"(\d+(?:[.,]\d+)?)[ \t]*грн[ \t]*/?[ \t]*км", 
 _RE_VES_THRESHOLD_GENERAL = re.compile(
     r"ваг\w*[ \t]*від[ \t]*(\d+(?:[.,]\d+)?)[ \t]*по[ \t]*(\d+(?:[.,]\d+)?)[ \t]*грн[ \t]*/[ \t]*кг", re.IGNORECASE
 )
+_RE_VES_FORMULA = re.compile(
+    r"кг[^\n]*?\*[ \t]*(\d+(?:[.,]\d+)?)[ \t]*грн", re.IGNORECASE
+)
 _RE_PROHOD_ETAZH_COMBINED = re.compile(
     r"(?:(?:прохід|проход)[ \t]*/[ \t]*поверх|поверх[ \t]*/[ \t]*(?:прохід|проход))"
     r"[ \t]*(?:пішки)?[ \t]*по[ \t]*(\d+(?:[.,]\d+)?)",
@@ -801,6 +804,17 @@ def _apply_keyword_overrides(result: dict, order_text: str):
         stavka = float(m.group(2).replace(",", "."))
         tj["ves"] = {"tip": "porogovaya", "porogi": [{"ot": ot, "stavka": stavka}]}
         result["_ves_trusted"] = True
+    else:
+        m = _RE_VES_FORMULA.search(order_text or "")
+        if m:
+            # Реальный кейс: "44 вивіски*87 кг=3828*4 грн=15312 грн" -
+            # ставка веса спрятана как множитель перед "грн" в цепочке
+            # вычислений (итоговый вес * ставка = итоговая сумма), не в
+            # привычном формате "від X по Y".
+            stavka = float(m.group(1).replace(",", "."))
+            if stavka <= 15:
+                tj["ves"] = {"tip": "ploskaya", "stavka": stavka}
+                result["_ves_trusted"] = True
 
     m = _RE_PROHOD_ETAZH_COMBINED.search(order_text or "")
     if m:
@@ -1284,7 +1298,20 @@ def _strip_duplicate_dop_tochka_km(result: dict, order_text: str):
         tj["dop_tochka"] = None
 
 
-def _strip_implausible_dop_tochka(result: dict):
+def _has_explicit_word_trigger(order_text: str, word_stem: str, value) -> bool:
+    """Проверяет, стоит ли слово (например 'точк', 'гідроборт') явно
+    рядом с этим конкретным числом в тексте - в любом порядке. Если да -
+    это НЕ неоднозначный случай, а явное указание автора заявки, и
+    диапазон правдоподобия проверять не нужно - человек написал прямым
+    текстом, чему верить."""
+    val_str = re.escape(_fmt_num(value))
+    pattern = re.compile(
+        rf"{word_stem}\w*[ \t]*{val_str}\b|{val_str}[ \t]*{word_stem}\w*", re.IGNORECASE
+    )
+    return bool(pattern.search(order_text or ""))
+
+
+def _strip_implausible_dop_tochka(result: dict, order_text: str = ""):
     """Подтверждено: доп.точка всегда 150/200/250/300.../700 и т.д. (от
     150, кратно 50) - никогда не бывает мелких чисел вроде 44. Реальный
     кейс (15.08): "Тар авто 1300/400/44" - GPT засунул "44" в доп.точку
@@ -1295,6 +1322,11 @@ def _strip_implausible_dop_tochka(result: dict):
     "ГБ?" предлагаем кандидатом только если число вообще попадает в
     правдоподобный диапазон ГБ (200-800, кратно 50) - иначе не путаем
     логиста заведомо неподходящим вариантом.
+
+    ИСКЛЮЧЕНИЕ (реальный кейс 18.08): если рядом с этим числом в тексте
+    явно написано слово "точка" (например "Точка 0" - логист явно
+    указал, что доплаты за точку нет) - это НЕ неоднозначный случай,
+    диапазон не проверяем вообще, доверяем прямому указанию.
     """
     tj = result.setdefault("tariff_json", {})
     dt = tj.get("dop_tochka")
@@ -1302,6 +1334,8 @@ def _strip_implausible_dop_tochka(result: dict):
         return
     v = dt["summa"]
     if v < 150 or v % 50 != 0:
+        if _has_explicit_word_trigger(order_text, "точк", v):
+            return  # явно написано "точка X" в тексте - доверяем, не сомневаемся
         tj["dop_tochka"] = None
         candidates = ["км?"]
         if _is_plausible_gidrobort(v):
@@ -1311,16 +1345,26 @@ def _strip_implausible_dop_tochka(result: dict):
         result["neponyatno"] = neponyatno
 
 
-def _strip_implausible_gidrobort(result: dict):
+def _strip_implausible_gidrobort(result: dict, order_text: str = ""):
     """Симметрично доп.точке: ГБ всегда 200/250/300.../800 (кратно 50) -
     никогда не бывает мелких чисел. Если GPT поставил в гідроборт число
-    вне диапазона - убираем, переносим в neponyatno."""
+    вне диапазона - убираем, переносим в neponyatno.
+
+    ИСКЛЮЧЕНИЕ: если рядом с числом в тексте явно написано "гідроборт"
+    или "ГБ" - доверяем прямому указанию, диапазон не проверяем."""
     tj = result.setdefault("tariff_json", {})
     gb = tj.get("gidrobort")
     if not gb or gb.get("summa") is None:
         return
     v = gb["summa"]
     if not _is_plausible_gidrobort(v):
+        val_str = re.escape(_fmt_num(v))
+        explicit = re.search(
+            rf"(?:гідроборт\w*|ГБ)[ \t]*{val_str}\b|{val_str}[ \t]*(?:гідроборт\w*|ГБ)",
+            order_text or "", re.IGNORECASE,
+        )
+        if explicit:
+            return
         tj["gidrobort"] = None
         candidates = ["км?"]
         if v >= 150 and v % 50 == 0:
@@ -1330,7 +1374,7 @@ def _strip_implausible_gidrobort(result: dict):
         result["neponyatno"] = neponyatno
 
 
-def _strip_implausible_etazhi_prohody(result: dict):
+def _strip_implausible_etazhi_prohody(result: dict, order_text: str = ""):
     """Реальный кейс (12.08): GPT поставил etazhi_stavka=0 - мусорное
     значение, не связанное ни с одним реальным числом в тексте (0 не
     несёт информации, показывать его как предупреждение бессмысленно).
@@ -1338,17 +1382,28 @@ def _strip_implausible_etazhi_prohody(result: dict):
     в neponyatno - в отличие от доп.точки/ГБ, тут восстанавливать
     нечего, это просто мусор.
 
-    ИСКЛЮЧЕНИЕ: если значения пришли из доверенного детерминированного
-    шаблона (флаг '_etazhi_prohody_trusted' - см.
-    _apply_vitaliya_gruzchiki_template, где этаж/проход реально бывают
-    меньше обычного диапазона, например 10) - не трогаем вообще."""
+    ИСКЛЮЧЕНИЯ:
+    1) Если значения пришли из доверенного детерминированного шаблона
+       (флаг '_etazhi_prohody_trusted') - не трогаем вообще.
+    2) Если рядом с числом в тексте явно написано "поверх"/"этаж" или
+       "прохід"/"проход" - доверяем прямому указанию, диапазон не
+       проверяем (аналогично доп.точке/ГБ)."""
     if result.pop("_etazhi_prohody_trusted", False):
         return
     tj = result.setdefault("tariff_json", {})
-    for key, (lo, hi) in (("etazhi_stavka", (20, 100)), ("prohody_stavka", (20, 50))):
+    triggers = {"etazhi_stavka": ("поверх|этаж|эт", (20, 100)), "prohody_stavka": ("прохід|проход", (20, 50))}
+    for key, (word_pattern, (lo, hi)) in triggers.items():
         v = tj.get(key)
-        if v is not None and not (lo <= v <= hi):
-            tj[key] = None
+        if v is None or lo <= v <= hi:
+            continue
+        val_str = re.escape(_fmt_num(v))
+        explicit = re.search(
+            rf"(?:{word_pattern})\w*[ \t]*{val_str}\b|{val_str}[ \t]*(?:{word_pattern})\w*",
+            order_text or "", re.IGNORECASE,
+        )
+        if explicit:
+            continue
+        tj[key] = None
 
 
 _FORMA_NAL_RE = re.compile(r"нал|готів", re.IGNORECASE)
@@ -1518,6 +1573,48 @@ def _recover_avto_baza_from_tar_line(result: dict, order_text: str):
         pass
 
 
+def _normalize_neponyatno_candidates(result: dict):
+    """Реальный кейс: GPT сам предложил '40: ГБ?/точка?' - но 40 не
+    подходит НИ под ГБ (200-800), НИ под доп.точку (150+, кратно 50) по
+    цене вообще, а "км?" (у которого нет жёсткого нижнего порога) вообще
+    не был предложен в кандидатах. Это ошибка самого GPT при составлении
+    списка кандидатов, не наша функция классификации - GPT просто не
+    последовал собственному правилу диапазонов при выборе, что предложить.
+
+    Финальная чистка независимо от источника: убираем "ГБ?"/"точка?" из
+    кандидатов, если число не подходит им по диапазону, и ВСЕГДА
+    добавляем "км?", если его ещё нет - у км нет жёсткого нижнего
+    порога, он универсальный запасной вариант."""
+    kept = []
+    for item in result.get("neponyatno") or []:
+        m = _NEPONYATNO_ITEM_RE.match(item)
+        if not m:
+            kept.append(item)
+            continue
+        num_str, cands_str = m.groups()
+        try:
+            val = float(num_str.replace(",", "."))
+        except ValueError:
+            kept.append(item)
+            continue
+
+        cands = [c.strip() for c in cands_str.split("/") if c.strip()]
+        new_cands = []
+        for c in cands:
+            low = c.lower().rstrip("?")
+            if low == "гб" and not _is_plausible_gidrobort(val):
+                continue
+            if low == "точка" and (val < 150 or val % 50 != 0):
+                continue
+            new_cands.append(c)
+        if not any(c.lower().rstrip("?") == "км" for c in new_cands):
+            new_cands.append("км?")
+        if not new_cands:
+            new_cands = ["км?"]
+        kept.append(f"{num_str}: " + "/".join(new_cands))
+    result["neponyatno"] = kept
+
+
 def _dedupe_neponyatno_by_number(result: dict):
     """Последняя защита от дублей: одно и то же число иногда попадает в
     'не понял' из разных источников (GPT сам плюс наши защитные функции),
@@ -1658,14 +1755,15 @@ def parse_tariff_via_gpt(order_text: str) -> dict:
         _strip_bogus_gidrobort(result)
         _strip_bogus_dop_tochka_without_word(result, order_text)
         _strip_duplicate_dop_tochka_km(result, order_text)
-        _strip_implausible_dop_tochka(result)
-        _strip_implausible_gidrobort(result)
-        _strip_implausible_etazhi_prohody(result)
+        _strip_implausible_dop_tochka(result, order_text)
+        _strip_implausible_gidrobort(result, order_text)
+        _strip_implausible_etazhi_prohody(result, order_text)
         _normalize_forma_oplaty(result)
         _reconcile_neponyatno(result)
         _apply_hodka_context_to_dop_tochka(result, order_text)
         _split_gruzchiki_dopy_by_plausibility(result)
         _recover_avto_baza_from_tar_line(result, order_text)
+        _normalize_neponyatno_candidates(result)
         _dedupe_neponyatno_by_number(result)
         return result
     except Exception as e:
