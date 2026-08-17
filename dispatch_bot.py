@@ -1870,7 +1870,12 @@ def parse_tariff_via_gpt(order_text: str) -> dict:
     try:
         completion = _openai_client.chat.completions.create(
             model="gpt-5.6-sol",
-            temperature=0,
+            # temperature=0 убран: gpt-5.6-sol не поддерживает кастомные
+            # значения temperature (только дефолтное 1) - в отличие от
+            # gpt-4o-mini, которая разрешала 0 для детерминированности.
+            # Попытка передать temperature=0 валила ЛЮБОЙ разбор тарифа
+            # с ошибкой 400 ("Error code: 400 - Unsupported value:
+            # 'temperature' does not support 0 with this model").
             messages=[
                 {"role": "system", "content": _TARIFF_SYSTEM_PROMPT},
                 {"role": "user", "content": order_text},
