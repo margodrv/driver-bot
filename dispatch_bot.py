@@ -761,6 +761,10 @@ _RE_ETAZH_GENERAL = re.compile(
 _RE_NICHNI_GENERAL = re.compile(
     r"(?:нічн\w*[ \t]*(\d+(?:[.,]\d+)?))|(?:(\d+(?:[.,]\d+)?)[ \t]*нічн\w*)", re.IGNORECASE
 )
+_RE_HODKA_PRICE = re.compile(
+    r"(?:ходк\w*[ \t]*(\d+(?:[.,]\d+)?)[ \t]*грн)|(?:(\d+(?:[.,]\d+)?)[ \t]*грн[ \t]*(?:за[ \t]*)?ходк\w*)",
+    re.IGNORECASE,
+)
 _RE_DOPY_GENERIC = re.compile(
     r"(?:\bдоп(?:и|ы|ов)?\b[ \t]*(\d+(?:[.,]\d+)?))|(?:(\d+(?:[.,]\d+)?)[ \t]*\bдоп(?:и|ы|ов)?\b)",
     re.IGNORECASE,
@@ -884,6 +888,15 @@ def _apply_keyword_overrides(result: dict, order_text: str):
         prochie = [d for d in (tj.get("prochie_dopy") or []) if (d.get("nazvanie") or "").strip().lower() != "нічне зберігання"]
         prochie.append({"nazvanie": "Нічне зберігання", "summa": val, "group": "avto"})
         tj["prochie_dopy"] = prochie
+
+    m = _RE_HODKA_PRICE.search(order_text or "")
+    if m:
+        # Подтверждено: если цена ЯВНО привязана к слову "ходка"
+        # ("ходка 1000 грн") - это реальная доп.ходка, а не подсказка
+        # про доп.точку. Отличие от контекстного сигнала ниже (просто
+        # "буде ходка" без цены рядом).
+        val = float((m.group(1) or m.group(2)).replace(",", "."))
+        tj["dop_hodka"] = {"tip": "сумма", "summa": val}
 
     if tj.get("etazhi_stavka") is None and tj.get("prohody_stavka") is None:
         m = _RE_DOPY_GENERIC.search(order_text or "")
@@ -1336,6 +1349,32 @@ def _fix_kom_duplicating_dop_chas(result: dict, order_text: str):
         result["kom_avto"] = {"znachenie": float(m.group(1).replace(",", ".")), "tip": "%"}
 
 
+def _recover_kom_percent_if_missing(result: dict, order_text: str):
+    """Реальный кейс (после смены модели на gpt-5.6-sol): текст явно
+    содержал 'Ком 10%', но GPT комиссию вообще не заполнил - ни kom_avto,
+    ни kom_gruzchiki - а вместо этого её же число "10" всплыло отдельно
+    как "не понял: 10: км?" (потеряв % по пути). Если комиссия ПОЛНОСТЬЮ
+    пустая, а в тексте есть явный "Ком X%" - берём напрямую регэкспом,
+    гарантированно, не полагаясь на то, что GPT в этот раз распознает
+    свою же собственную явную комиссию. Заодно убираем дублирующее
+    предупреждение по этому же числу, если оно там осело."""
+    if result.get("kom_avto") or result.get("kom_gruzchiki"):
+        return
+    m = _RE_KOM_PERCENT_GENERAL.search(order_text or "")
+    if not m:
+        return
+    val = float(m.group(1).replace(",", "."))
+    result["kom_avto"] = {"znachenie": val, "tip": "%"}
+    val_str = _fmt_num(val)
+    kept = []
+    for item in result.get("neponyatno") or []:
+        m2 = _NEPONYATNO_ITEM_RE.match(item)
+        if m2 and m2.group(1) == val_str:
+            continue
+        kept.append(item)
+    result["neponyatno"] = kept
+
+
 def _strip_client_pays_from_kom(result: dict, order_text: str):
     """Реальный кейс (15.08): текст содержал '...клиент платит 4900 грн'
     (информационная пометка - сколько всего платит клиент, ни разу не
@@ -1642,10 +1681,12 @@ def _split_gruzchiki_dopy_by_plausibility(result: dict):
     такими маленькими. Такие числа классифицируются в вес автоматически,
     без вопроса.
 
-    Числа больше 15 (например тот же '20') неоднозначны - могут быть
-    этажом/проходом/км - НЕ угадываем, а переносим в явное предупреждение
-    "не понял" с кандидатами, чтобы логист мог решить одним нажатием
-    кнопки (а не искать глазами в строке 'Грузчики: .../20').
+    Число больше 15 (например тот же '20') - ОБЩАЯ ставка сразу на
+    этажи И проходы вместе (аналогично общему слову "допи" в тексте),
+    даже без слов-подсказок рядом: "мы не знаем что именно будет, но
+    клиент предупреждён о стоимости" - подтверждено логистом-владельцем
+    как правило именно для ЭТОГО контекста (лишние числа в строке
+    грузчиков), автоматически, без переспроса через кнопку.
     """
     dopy = result.get("gruzchiki_dopy") or []
     if not dopy:
@@ -1653,12 +1694,19 @@ def _split_gruzchiki_dopy_by_plausibility(result: dict):
     tj = result.setdefault("tariff_json", {})
     remaining = []
     neponyatno = list(result.get("neponyatno") or [])
+    etazh_prohod_assigned = tj.get("etazhi_stavka") is not None or tj.get("prohody_stavka") is not None
     for val in dopy:
         if val <= 15 and not tj.get("ves"):
             tj["ves"] = {"tip": "ploskaya", "stavka": val}
         elif val <= 15:
             remaining.append(val)  # вес уже занят другим числом - редкий случай, оставляем как есть
+        elif not etazh_prohod_assigned:
+            tj["etazhi_stavka"] = val
+            tj["prohody_stavka"] = val
+            etazh_prohod_assigned = True
         else:
+            # Этажи/проходы уже назначены другим числом - следующее
+            # число >15 остаётся неоднозначным, спрашиваем как раньше.
             neponyatno.append(f"{_fmt_num(val)}: этаж?/проход?/км?")
     result["gruzchiki_dopy"] = remaining
     result["neponyatno"] = neponyatno
@@ -1802,11 +1850,20 @@ def _apply_hodka_context_to_dop_tochka(result: dict, order_text: str):
     где-то в тексте "(три ходки)" - GPT оставил 500 в 'не понял', хотя
     по контексту это явно доп.точка.
 
+    Симметричный сигнал (найдено 18.08): маркеры Т3/Т4/... (третья и
+    далее точка маршрута) в тексте - тоже прямое доказательство доп.точки,
+    даже без слова "ходка" вообще. Реальный кейс: "Т1.../Т2.../Т3.../Т4..."
+    (4 точки маршрута) + "Тар 2600/700/500" - GPT оставил 500 в 'не
+    понял', хотя маршрут явно многоточечный.
+
     Если доп.точка уже определена - не трогаем. Ищем среди 'не понял'
     первое число, подходящее по диапазону (150-700+, кратно 50), и
     переводим его в доп.точку.
     """
-    if "ходк" not in (order_text or "").lower():
+    text_low = (order_text or "").lower()
+    has_hodka_context = "ходк" in text_low and not _RE_HODKA_PRICE.search(order_text or "")
+    has_extra_stops = bool(re.search(r"\bт[3-9]\b", text_low, re.IGNORECASE))
+    if not (has_hodka_context or has_extra_stops):
         return
     tj = result.setdefault("tariff_json", {})
     if tj.get("dop_tochka"):
@@ -1905,6 +1962,7 @@ def parse_tariff_via_gpt(order_text: str) -> dict:
         _strip_bogus_gruzchiki(result, order_text)
         _strip_bogus_kom(result, order_text)
         _strip_client_pays_from_kom(result, order_text)
+        _recover_kom_percent_if_missing(result, order_text)
         _strip_bogus_km(result, order_text)
         result["neponyatno"] = _filter_neponyatno(result)
         _strip_bogus_gidrobort(result)
@@ -2041,11 +2099,11 @@ def _format_avto_extra_lines(tj: dict, star) -> list:
     dh = tj.get("dop_hodka")
     if dh:
         if dh.get("tip") == "сумма":
-            lines.append(f"Доп.ходка: {_fmt_num(dh.get('summa'))} грн")
+            lines.append(f"Доп.ходка: {_fmt_num(dh.get('summa'))} грн{star(['dop_hodka'])}")
         elif dh.get("tip") == "vhodit_v_tarif":
-            lines.append("Доп.ходка: входит в тариф")
+            lines.append(f"Доп.ходка: входит в тариф{star(['dop_hodka'])}")
         elif dh.get("tip") == "utochnit":
-            lines.append("Доп.ходка: уточнить")
+            lines.append(f"Доп.ходка: уточнить{star(['dop_hodka'])}")
 
     if tj.get("km_stavka") is not None:
         lines.append(f"Км: {_fmt_num(tj['km_stavka'])} грн/км{star(['km'])}")
@@ -2410,6 +2468,17 @@ def _apply_rokla(tariff, text):
         tj["prochie_dopy"] = prochie
 
 
+def _apply_dop_hodka(tariff, text):
+    t = text.strip().lower()
+    tj = tariff.setdefault("tariff_json", {})
+    if t in _EMPTY_VALUES:
+        tj["dop_hodka"] = None
+        return
+    v = _parse_one_number(text)
+    tj["dop_hodka"] = {"tip": "сумма", "summa": v}
+    _resolve_neponyatno(tariff, v)
+
+
 # field_key -> {label, hint, apply(tariff, text), columns затрагиваемые в Sheets}
 # Каждое поле правится НЕЗАВИСИМО одним числом - никаких "два числа через
 # /" в одном вводе, чтобы нельзя было случайно стереть соседнее значение,
@@ -2442,6 +2511,10 @@ FIELD_DEFS = {
     "rokla": {
         "label": "Рокла", "hint": "например: 400 (или '-' чтобы убрать)",
         "apply": _apply_rokla, "columns": ["Тариф_JSON"],
+    },
+    "dop_hodka": {
+        "label": "Доп.ходка", "hint": "например: 700 (или '-' чтобы убрать)",
+        "apply": _apply_dop_hodka, "columns": ["Тариф_JSON"],
     },
     "kom_avto": {
         "label": "Ком. авто", "hint": "10% или 500, или 1000/400 - ступенчато по часам",
@@ -2522,6 +2595,7 @@ def tariff_level1_keyboard(order_key: str) -> InlineKeyboardMarkup:
 _EDIT_MENU_ROWS = [
     ["avto_baza", "avto_dop_chas", "min_chasov"],
     ["km", "dop_tochka", "gidrobort"],
+    ["dop_hodka"],
     ["rokla", "kom_avto", "kom_gruzchiki"],
     ["gruzchiki_baza", "gruzchiki_dop_chas", "gruzchiki_chasov"],
     ["etazhi", "prohody", "ves"],
@@ -2535,6 +2609,7 @@ _EDIT_MENU_LABELS = {
     "km": "🚘 Км",
     "dop_tochka": "🚘 Точка",
     "gidrobort": "🚘 ГБ",
+    "dop_hodka": "🚘 Доп.ходка",
     "rokla": "🚘 Рокла",
     "kom_avto": "🚘 Ком авто",
     "kom_gruzchiki": "🏋️\u200d♀️ Ком грузчики",

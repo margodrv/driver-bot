@@ -68,6 +68,7 @@ def run_deterministic_pipeline(start_result: dict, order_text: str) -> dict:
     db._strip_bogus_gruzchiki(result, order_text)
     db._strip_bogus_kom(result, order_text)
     db._strip_client_pays_from_kom(result, order_text)
+    db._recover_kom_percent_if_missing(result, order_text)
     db._strip_bogus_km(result, order_text)
     result["neponyatno"] = db._filter_neponyatno(result)
     db._strip_bogus_gidrobort(result)
@@ -405,6 +406,50 @@ run_case(
     order_text="Авто: бус + 1 пасажир\nТариф 3000/500",
     start_result={"avto_baza": 3000, "avto_dop_chas": 500},
     must_not_contain=["Пасажирське місце"],
+)
+
+run_case(
+    "Комиссия полностью пропала, хотя явно указана 'Ком X%'",
+    order_text="Тар авто 5000/1500/700\nТар вантажник 600/300\nКом 10%\nОплата БН",
+    start_result={"avto_baza": 5000, "avto_dop_chas": 1500, "gruzchiki_baza": 600, "gruzchiki_dop_chas": 300,
+                  "kom_avto": None, "kom_gruzchiki": None, "neponyatno": ["10: км?"]},
+    must_contain=["Ком. 10%"],
+    must_not_contain=["не понял: 10"],
+)
+
+run_case(
+    "Число >15 среди лишних чисел грузчиков → этажи+проходы автоматически (без переспроса)",
+    order_text="5т гідроборт + 2 вантажника\nТариф авто 5300/900\nвантажники 1600/800/4/20\nКом 800",
+    start_result={"avto_baza": 5300, "avto_dop_chas": 900, "min_chasov": 3,
+                  "gruzchiki_baza": 1600, "gruzchiki_dop_chas": 800, "gruzchiki_dopy": [4, 20],
+                  "kom_avto": {"znachenie": 800, "tip": "сумма"}},
+    must_contain=["Вес: 4 грн/кг", "Этажи: 20 грн", "Проходы: 20 грн"],
+    must_not_contain=["не понял"],
+)
+
+run_case(
+    "Маркеры Т3/Т4 в маршруте → неясное число становится доп.точкой",
+    order_text="18.08 12:00 + - 3т ГБ\nТ1 Сырецкая 31\nТ2 Гвардейская\nТ3 Сырецкая 31\nТ4 Шелуденко\nТар 2600/700/500",
+    start_result={"avto_baza": 2600, "avto_dop_chas": 700, "min_chasov": 2,
+                  "neponyatno": ["500: ГБ?/точка?/км?"]},
+    must_contain=["Доп.точка: +500 грн"],
+    must_not_contain=["не понял"],
+)
+
+run_case(
+    "Явная 'ходка 1000 грн' → доп.ходка, соседнее число НЕ трогаем",
+    order_text="Можливо ходка 1000 грн\nТар 4500/1000/500",
+    start_result={"avto_baza": 4500, "avto_dop_chas": 1000, "neponyatno": ["500: ГБ?/точка?/км?"]},
+    must_contain=["Доп.ходка: 1000 грн", "не понял: 500"],
+    must_not_contain=["Доп.точка"],
+)
+
+run_case(
+    "'Буде ходка' БЕЗ цены → контекстный сигнал доп.точки (как раньше)",
+    order_text="Буде ходка можливо\nТар 4500/1000/500",
+    start_result={"avto_baza": 4500, "avto_dop_chas": 1000, "neponyatno": ["500: ГБ?/точка?/км?"]},
+    must_contain=["Доп.точка: +500 грн"],
+    must_not_contain=["Доп.ходка", "не понял"],
 )
 
 # ============================================================================
