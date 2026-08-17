@@ -679,13 +679,20 @@ def _apply_shared_tariff_hours(result: dict, order_text: str):
 
 def _recover_avto_dop_chas(result: dict, order_text: str):
     """Страховка: если GPT нашёл avto_baza, но НЕ нашёл avto_dop_chas
-    (осталось null) - пробуем достать его напрямую регэкспом из текста.
-    Реальный случай (11.08): "4750/950БН" - число доп.часа СЛИПЛОСЬ с
-    формой оплаты без пробела ("950БН"), GPT не смог вычленить числовую
-    часть и заодно ошибочно решил, что раз второго числа нет - это
-    "фикс". НЕ пропускаем проверку из-за tip_rascheta="фикс" - как раз в
-    этом состоянии чаще всего и нужно восстановление: если в тексте
-    реально есть "<база>/<число>", тариф почасовый, что бы GPT ни решил.
+    (осталось null) - пробуем достать его напрямую регэкспом из текста,
+    двумя способами по очереди.
+
+    Способ 1: "<база>/<число>" рядом со словом "тариф" (реальный случай
+    11.08: "4750/950БН" - число доп.часа слиплось с формой оплаты без
+    пробела, GPT не смог вычленить числовую часть).
+
+    Способ 2 (если первый не сработал): "Наступна: X грн" отдельной
+    строкой, без слэша вообще (реальный случай: "Тариф:7000- 3 години
+    \\nНаступна: 1400 грн" - тире вместо слэша, доп.час на отдельной
+    строке).
+
+    НЕ пропускаем проверку из-за tip_rascheta="фикс" - как раз в этом
+    состоянии чаще всего и нужно восстановление.
     """
     if result.get("avto_dop_chas") is not None:
         return
@@ -693,20 +700,28 @@ def _recover_avto_dop_chas(result: dict, order_text: str):
     if baza is None:
         return
     text = order_text or ""
-    # Ищем только рядом со словом "тариф"/"тар" - не по всему тексту,
-    # чтобы случайно не зацепить похожее число из адреса/телефона в
-    # другом месте заявки.
+
+    # Способ 1: "<база>/<число>" рядом со словом "тариф".
     kw = re.search(r"тар(?:иф)?", text, re.IGNORECASE)
     search_region = text[kw.start():kw.start() + 120] if kw else text
     baza_str = re.escape(_fmt_num(baza))
     m = re.search(rf"{baza_str}\s*/\s*(\d+(?:[.,]\d+)?)", search_region)
-    if not m:
-        return
-    try:
-        result["avto_dop_chas"] = float(m.group(1).replace(",", "."))
-        result["tip_rascheta"] = "почасовка"
-    except ValueError:
-        pass
+    if m:
+        try:
+            result["avto_dop_chas"] = float(m.group(1).replace(",", "."))
+            result["tip_rascheta"] = "почасовка"
+            return
+        except ValueError:
+            pass
+
+    # Способ 2: "Наступна: X грн" отдельной строкой, без слэша.
+    m2 = re.search(r"наступн\w*[:\s]*(\d+(?:[.,]\d+)?)", text, re.IGNORECASE)
+    if m2:
+        try:
+            result["avto_dop_chas"] = float(m2.group(1).replace(",", "."))
+            result["tip_rascheta"] = "почасовка"
+        except ValueError:
+            pass
 
 
 _TEMPLATE_MARKERS = ("тар авто", "наступна година", "гідроборт", "рокла", "заміський", "вантажник", "вагі від", "прохід")
@@ -1223,6 +1238,24 @@ def _strip_bogus_km(result: dict, order_text: str):
     neponyatno = list(result.get("neponyatno") or [])
     neponyatno.append(f"{_fmt_num(km)}: ГБ?/точка?")
     result["neponyatno"] = neponyatno
+
+
+_RE_KOM_PERCENT_GENERAL = re.compile(r"ком[:\s]*(\d+(?:[.,]\d+)?)[ \t]*%", re.IGNORECASE)
+
+
+def _fix_kom_duplicating_dop_chas(result: dict, order_text: str):
+    """Реальный кейс: 'Наступна: 1400 грн' + отдельно 'Ком 20%' - GPT
+    продублировал 1400 (доп.час) в kom_avto как сумму, полностью
+    проигнорировав настоящую комиссию 20%. Если сумма комиссии совпадает
+    с доп.часом авто, а в тексте отдельно есть явный процент 'Ком X%' -
+    используем реальный процент вместо дубля."""
+    ka = result.get("kom_avto")
+    dop = result.get("avto_dop_chas")
+    if not (ka and ka.get("tip") == "сумма" and dop is not None and ka.get("znachenie") == dop):
+        return
+    m = _RE_KOM_PERCENT_GENERAL.search(order_text or "")
+    if m:
+        result["kom_avto"] = {"znachenie": float(m.group(1).replace(",", ".")), "tip": "%"}
 
 
 def _strip_client_pays_from_kom(result: dict, order_text: str):
@@ -1745,6 +1778,7 @@ def parse_tariff_via_gpt(order_text: str) -> dict:
         _apply_avto_gruzchiki_multiline_template(result, order_text)
         _apply_keyword_overrides(result, order_text)
         _recover_avto_dop_chas(result, order_text)
+        _fix_kom_duplicating_dop_chas(result, order_text)
         _apply_shared_tariff_hours(result, order_text)
         _reclassify_small_kom_as_percent(result, order_text)
         _strip_bogus_gruzchiki(result, order_text)
