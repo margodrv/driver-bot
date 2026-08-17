@@ -622,7 +622,7 @@ def find_pending_neponyatno_value(tariff: dict, field_key: str):
     return matches[0] if len(matches) == 1 else None
 
 
-_LOADER_TEXT_RE = re.compile(r"вантаж|груз", re.IGNORECASE)
+_LOADER_TEXT_RE = re.compile(r"(?<![а-яіїєґ])вантаж\w*|(?<![а-яіїєґ])груз\w*", re.IGNORECASE)
 
 
 _VITALIYA_RE = re.compile(r"виталия", re.IGNORECASE)
@@ -748,9 +748,11 @@ _RE_VES_THRESHOLD_GENERAL = re.compile(
 _RE_VES_FORMULA = re.compile(
     r"кг[^\n]*?\*[ \t]*(\d+(?:[.,]\d+)?)[ \t]*грн", re.IGNORECASE
 )
+_RE_VES_BARE = re.compile(r"\b(?:вес\w*|ваг\w*)[:\s]*(\d+(?:[.,]\d+)?)\b", re.IGNORECASE)
+_COMBO_ETAZH_PROHOD_WORD = r"(?:прохід\w*|проход\w*|поверх\w*|этаж\w*)"
 _RE_PROHOD_ETAZH_COMBINED = re.compile(
-    r"(?:(?:прохід|проход)[ \t]*/[ \t]*поверх|поверх[ \t]*/[ \t]*(?:прохід|проход))"
-    r"[ \t]*(?:пішки)?[ \t]*по[ \t]*(\d+(?:[.,]\d+)?)",
+    rf"{_COMBO_ETAZH_PROHOD_WORD}[ \t]*/[ \t]*{_COMBO_ETAZH_PROHOD_WORD}"
+    rf"[ \t]*(?:пішки)?[,\s]*(?:по[ \t]*)?(\d+(?:[.,]\d+)?)",
     re.IGNORECASE,
 )
 _RE_ETAZH_GENERAL = re.compile(
@@ -759,6 +761,19 @@ _RE_ETAZH_GENERAL = re.compile(
 _RE_NICHNI_GENERAL = re.compile(
     r"(?:нічн\w*[ \t]*(\d+(?:[.,]\d+)?))|(?:(\d+(?:[.,]\d+)?)[ \t]*нічн\w*)", re.IGNORECASE
 )
+_RE_DOPY_GENERIC = re.compile(
+    r"(?:\bдоп(?:и|ы|ов)?\b[ \t]*(\d+(?:[.,]\d+)?))|(?:(\d+(?:[.,]\d+)?)[ \t]*\bдоп(?:и|ы|ов)?\b)",
+    re.IGNORECASE,
+)
+_RE_PASSENGER_TOTAL_IN_PARENS = re.compile(
+    r"\([ \t]*(\d+(?:[.,]\d+)?)[ \t]*за[ \t]*(?:двох|трьох|чотирьох|п'ятьох|\d+)[ \t]*\)",
+    re.IGNORECASE,
+)
+_RE_PASSENGER_BASE_PRICE = re.compile(
+    r"пас(?:ажир\w*|сажир\w*)?[.\s]*(?:м[іi]сц\w*)?[ \t]*(\d+(?:[.,]\d+)?)[ \t]*грн",
+    re.IGNORECASE,
+)
+_PASSENGER_WORD_RE = re.compile(r"пас(?:ажир|сажир)\w*", re.IGNORECASE)
 
 
 def _apply_keyword_overrides(result: dict, order_text: str):
@@ -830,6 +845,16 @@ def _apply_keyword_overrides(result: dict, order_text: str):
             if stavka <= 15:
                 tj["ves"] = {"tip": "ploskaya", "stavka": stavka}
                 result["_ves_trusted"] = True
+        else:
+            m = _RE_VES_BARE.search(order_text or "")
+            if m:
+                # Самый простой случай: "вес 5" / "вага 5" голым числом,
+                # без порога и без формулы (реальный кейс: "этажи/проходы
+                # 35 грн, вес 5" - раньше не ловилось вообще никак).
+                stavka = float(m.group(1).replace(",", "."))
+                if stavka <= 15:
+                    tj["ves"] = {"tip": "ploskaya", "stavka": stavka}
+                    result["_ves_trusted"] = True
 
     m = _RE_PROHOD_ETAZH_COMBINED.search(order_text or "")
     if m:
@@ -859,6 +884,37 @@ def _apply_keyword_overrides(result: dict, order_text: str):
         prochie = [d for d in (tj.get("prochie_dopy") or []) if (d.get("nazvanie") or "").strip().lower() != "нічне зберігання"]
         prochie.append({"nazvanie": "Нічне зберігання", "summa": val, "group": "avto"})
         tj["prochie_dopy"] = prochie
+
+    if tj.get("etazhi_stavka") is None and tj.get("prohody_stavka") is None:
+        m = _RE_DOPY_GENERIC.search(order_text or "")
+        if m:
+            # Подтверждено: общее слово "допи"/"допы" (без уточнения
+            # "прохід"/"поверх") - это ОДНА ставка сразу на этажи И
+            # проходы вместе, как и явное "Прохід/поверх" ранее.
+            val = float((m.group(1) or m.group(2)).replace(",", "."))
+            tj["etazhi_stavka"] = val
+            tj["prohody_stavka"] = val
+
+    if _PASSENGER_WORD_RE.search(order_text or ""):
+        # Подтверждено: "пас"/"пасажир"/"пассажир" (всі варіанти на
+        # українській) - в 99% случаев бесплатно, отдельно не
+        # доплачивают. Если явной цены рядом нет - НЕ выдумываем ничего
+        # (аналогично гідроборту/роклі без цены). Если цена есть -
+        # приоритет у числа в скобках "(Y за N)" - оно явно указывает
+        # итоговую сумму за фактическое количество пассажиров, точнее
+        # базовой ставки за одного (реальный кейс: "1 пас.місце 300грн
+        # (600 за двох)" при факте 2 пасажирів - берём 600, не 300).
+        m_total = _RE_PASSENGER_TOTAL_IN_PARENS.search(order_text or "")
+        m_base = _RE_PASSENGER_BASE_PRICE.search(order_text or "")
+        val = None
+        if m_total:
+            val = float(m_total.group(1).replace(",", "."))
+        elif m_base:
+            val = float(m_base.group(1).replace(",", "."))
+        if val is not None:
+            prochie = [d for d in (tj.get("prochie_dopy") or []) if (d.get("nazvanie") or "").strip().lower() != "пасажирське місце"]
+            prochie.append({"nazvanie": "Пасажирське місце", "summa": val, "group": "avto"})
+            tj["prochie_dopy"] = prochie
 
 
 def _apply_avto_gruzchiki_multiline_template(result: dict, order_text: str):
@@ -976,8 +1032,13 @@ def _apply_vitaliya_sanobrobka_template(result: dict, order_text: str):
     result["gruzchiki_dop_chas"] = None
     result["gruzchiki_dopy"] = []
 
+    hm = re.search(r"тар[ \t]*бн[ \t]*(\d+(?:[.,]\d+)?)[ \t]*ч\b", order_text or "", re.IGNORECASE)
+    if hm and result.get("min_chasov") is None:
+        result["min_chasov"] = float(hm.group(1).replace(",", "."))
+
     tj = result.setdefault("tariff_json", {})
     tj["dop_tochka"] = {"tip": "doplata_fix", "summa": tochka}
+    result["_dop_tochka_trusted"] = True
     tj["km_stavka"] = km
     result["_km_trusted"] = True
     prochie = [d for d in (tj.get("prochie_dopy") or []) if (d.get("nazvanie") or "").strip().lower() != "санобробка"]
@@ -1107,6 +1168,7 @@ def _apply_vitaliya_gruzchiki_template(result: dict, order_text: str):
         result["forma_oplaty"] = "БН"
         result["kom_avto"] = {"znachenie": 0, "tip": "%"}
         result["kom_gruzchiki"] = None
+        result["_kom_trusted"] = True
 
     # Все числа этого шаблона классифицированы детерминированно.
     used = {_fmt_num(n) for n in (avto_baza, avto_dop, gr_baza, gr_dop, etazh, prohod, ves)}
@@ -1152,10 +1214,18 @@ def _strip_bogus_gruzchiki(result: dict, order_text: str):
     result["neponyatno"] = neponyatno
 
 
-_KOM_TEXT_RE = re.compile(r"ком|коміс", re.IGNORECASE)
+_KOM_TEXT_RE = re.compile(r"\bком\b|коміс\w*", re.IGNORECASE)
 
 
 def _kom_stray_numbers(k):
+    """Вызывается ТОЛЬКО когда уже точно известно, что слова 'ком'/
+    'коміс' в тексте нет вообще (проверено в _strip_bogus_kom до вызова
+    этой функции) - значит ЛЮБОЕ значение здесь подозрительно, включая
+    проценты. Раньше % был исключением ("% без слова 'ком' тоже
+    подозрительно, но сумма надёжнее показывает утечку чисел") - но это
+    оставляло дыру: комиссия-процент, выдуманная без единого текстового
+    основания, проходила защиту невредимой (реальный кейс: 15%
+    сохранился в превью, хотя в тексте вообще не было слова "ком")."""
     if not k:
         return []
     if k.get("tip") == "pochasovka":
@@ -1166,8 +1236,8 @@ def _kom_stray_numbers(k):
             nums.append(k["dop_chas"])
         nums.extend(k.get("dopy") or [])
         return nums
-    if k.get("znachenie") is not None and k.get("tip") != "%":
-        return [k["znachenie"]]  # % без слова "ком" тоже подозрительно, но сумма надёжнее показывает утечку чисел
+    if k.get("znachenie") is not None:
+        return [k["znachenie"]]
     return []
 
 
@@ -1177,7 +1247,15 @@ def _strip_bogus_kom(result: dict, order_text: str):
     вообще, даже если GPT попытался впихнуть туда лишние числа из строки
     тарифа авто (реальный кейс 10.08: "2100/600/200/1000/44" без единого
     слова про комиссию - GPT насочинял kom_avto из чисел, которые на
-    самом деле доп.точка/санобробка/км)."""
+    самом деле доп.точка/санобробка/км).
+
+    ИСКЛЮЧЕНИЕ (найдено тестами регрессии 20.08): доверенные
+    детерминированные шаблоны (флаг '_kom_trusted' - см.
+    _apply_vitaliya_gruzchiki_template, где комиссия 0% ставится по
+    бизнес-правилу "БН-заказы Виталии без комиссии", а не по слову
+    "ком" в тексте) не трогаем."""
+    if result.pop("_kom_trusted", False):
+        return
     if _KOM_TEXT_RE.search(order_text or ""):
         return  # текст явно упоминает комиссию - не трогаем
 
@@ -1293,7 +1371,16 @@ def _strip_bogus_dop_tochka_without_word(result: dict, order_text: str):
       кандидат, чем ничем не подтверждённая "точка")
     - если и рокла не упомянута - просто убираем в neponyatno, не
       теряя число молча
-    """
+
+    ИСКЛЮЧЕНИЕ (найдено тестами регрессии 20.08): доверенные
+    детерминированные шаблоны (флаг '_dop_tochka_trusted' - см.
+    _apply_vitaliya_sanobrobka_template, где доп.точка определяется по
+    позиции числа в шаблоне, а не по слову "точка" рядом) не трогаем -
+    эта защита создавалась для другого случая (GPT сам придумывает
+    доп.точку без всякого основания) и не должна портить шаблон, где
+    основание есть, просто не текстовое."""
+    if result.pop("_dop_tochka_trusted", False):
+        return
     tj = result.setdefault("tariff_json", {})
     dt = tj.get("dop_tochka")
     if not dt or dt.get("summa") is None:
@@ -1439,18 +1526,29 @@ def _strip_implausible_etazhi_prohody(result: dict, order_text: str = ""):
         tj[key] = None
 
 
-_FORMA_NAL_RE = re.compile(r"нал|готів", re.IGNORECASE)
+_FORMA_NAL_RE = re.compile(r"\bнал\w*|готів\w*", re.IGNORECASE)
 _FORMA_BN_RE = re.compile(r"без\s*нал|\bб\s*/?\s*н\b", re.IGNORECASE)
 
 
-def _normalize_forma_oplaty(result: dict):
+def _normalize_forma_oplaty(result: dict, order_text: str = ""):
     """Унифицируем формулировку формы оплаты - GPT иногда возвращает
     сырую фразу из текста целиком (например "готівкою або на карту")
     вместо строгого 'Нал'/'БН'. Подтверждено: любая формулировка с
     "нал"/"готівка" (даже вперемешку с упоминанием карты) - это "Нал".
-    Явное "безнал"/"БН" - это "БН". Всё остальное не трогаем."""
+    Явное "безнал"/"БН" - это "БН". Всё остальное не трогаем.
+
+    Реальный кейс (18.08): GPT иногда вообще НЕ заполняет forma_oplaty,
+    хотя в тексте явно написано "б/н счет" - поле остаётся пустым и
+    позже по умолчанию превращается в "Нал" (неверно). Если поле пустое -
+    ищем явный триггер прямо по всему тексту заявки, не только в том,
+    что GPT сам решил туда положить.
+    """
     fo = result.get("forma_oplaty")
     if not fo:
+        if _FORMA_BN_RE.search(order_text or ""):
+            result["forma_oplaty"] = "БН"
+        elif _FORMA_NAL_RE.search(order_text or ""):
+            result["forma_oplaty"] = "Нал"
         return
     if _FORMA_BN_RE.search(fo):
         result["forma_oplaty"] = "БН"
@@ -1570,6 +1668,10 @@ _RE_TAR_NUMBERS = re.compile(
     r"тар(?:иф)?[:\s]*(\d+(?:[.,]\d+)?)(?=[ \t]*(?:/|грн|\s|$))(?:[ \t]*/[ \t]*(\d+(?:[.,]\d+)?))?",
     re.IGNORECASE,
 )
+_RE_TAR_AVTO_NUMBERS = re.compile(
+    r"тар(?:иф)?[:\s]*\n?[ \t]*авто[ \t]*(\d+(?:[.,]\d+)?)(?:[ \t]*/[ \t]*(\d+(?:[.,]\d+)?))?",
+    re.IGNORECASE,
+)
 
 
 def _recover_avto_baza_from_tar_line(result: dict, order_text: str):
@@ -1586,8 +1688,22 @@ def _recover_avto_baza_from_tar_line(result: dict, order_text: str):
     Запускается ПОСЛЕДНИМ в цепочке - все детерминированные шаблоны уже
     успели сработать своей более точной логикой (если она была нужна),
     так что для них это просто ничего не изменит (числа и так совпадут).
+
+    ВАЖНО (найденная 18.08 регрессия от этой же защиты): текст может
+    содержать НЕСКОЛЬКО упоминаний слова "тариф" - например реальное
+    "Тариф\\nАвто 8150/1250" (у главного тарифа) И совершенно
+    постороннее "Тариф 250/час + допы 10" дальше по тексту (о чём-то
+    другом, не о машине). Простой .search() находил ПЕРВОЕ совпадение
+    паттерна - а раз "Тариф\\nАвто 8150" не совпадал с наивным
+    "тариф+число" (между ними слово "авто"), поиск пропускал его и
+    ошибочно хватал дальний посторонний "250". Теперь сначала ищем
+    приоритетный паттерн "Тариф(...)Авто X/Y" - именно он и есть
+    настоящий тариф в подавляющем большинстве заявок - и только если он
+    не найден, откатываемся на прежний более простой поиск.
     """
-    m = _RE_TAR_NUMBERS.search(order_text or "")
+    m = _RE_TAR_AVTO_NUMBERS.search(order_text or "")
+    if not m:
+        m = _RE_TAR_NUMBERS.search(order_text or "")
     if not m:
         return
     tar_baza = float(m.group(1).replace(",", "."))
@@ -1753,7 +1869,7 @@ def parse_tariff_via_gpt(order_text: str) -> dict:
         return fallback
     try:
         completion = _openai_client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-5.6-sol",
             temperature=0,
             messages=[
                 {"role": "system", "content": _TARIFF_SYSTEM_PROMPT},
@@ -1792,7 +1908,7 @@ def parse_tariff_via_gpt(order_text: str) -> dict:
         _strip_implausible_dop_tochka(result, order_text)
         _strip_implausible_gidrobort(result, order_text)
         _strip_implausible_etazhi_prohody(result, order_text)
-        _normalize_forma_oplaty(result)
+        _normalize_forma_oplaty(result, order_text)
         _reconcile_neponyatno(result)
         _apply_hodka_context_to_dop_tochka(result, order_text)
         _split_gruzchiki_dopy_by_plausibility(result)
@@ -2201,8 +2317,6 @@ def _apply_gidrobort(tariff, text):
     v = _parse_one_number(text)
     if v == 0:
         raise ValueError("0 не похоже на доплату 'по факту' - если доплаты нет, оставьте пустым ('-')")
-    if v < 200 or v > 800 or v % 50 != 0:
-        raise ValueError(f"{_fmt_num(v)} не похоже на ГБ (обычно 200/250/300.../800, кратно 50) - проверьте цифру, возможно это км/доп.точка")
     tj["gidrobort"] = {"summa": v, "po_faktu": False}
     _resolve_neponyatno(tariff, v)
 
@@ -2214,8 +2328,6 @@ def _apply_dop_tochka(tariff, text):
         tj["dop_tochka"] = None
         return
     v = _parse_one_number(text)
-    if v < 150 or v % 50 != 0:
-        raise ValueError(f"{_fmt_num(v)} не похоже на доп.точку (обычно 150/200/250.../700 и т.д., кратно 50) - проверьте цифру, возможно это км")
     tj["dop_tochka"] = {"tip": "doplata_fix", "summa": v}
     _resolve_neponyatno(tariff, v)
 
@@ -2249,8 +2361,6 @@ def _apply_etazhi(tariff, text):
         tj["etazhi_stavka"] = None
         return
     v = _parse_one_number(text)
-    if v < 20 or v > 100:
-        raise ValueError(f"{_fmt_num(v)} не похоже на этаж (обычно 20-100 грн: 20-30 для 1-10 этажа, до 100 выше) - проверьте цифру")
     tj["etazhi_stavka"] = v
     _resolve_neponyatno(tariff, v)
     _remove_from_gruzchiki_dopy(tariff, v)
@@ -2263,8 +2373,6 @@ def _apply_prohody(tariff, text):
         tj["prohody_stavka"] = None
         return
     v = _parse_one_number(text)
-    if v < 20 or v > 50:
-        raise ValueError(f"{_fmt_num(v)} не похоже на проход/допу (обычно 20-30 без весовых предметов, до 50 с ними) - проверьте цифру")
     tj["prohody_stavka"] = v
     _resolve_neponyatno(tariff, v)
     _remove_from_gruzchiki_dopy(tariff, v)
