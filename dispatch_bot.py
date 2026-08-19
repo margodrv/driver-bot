@@ -748,7 +748,16 @@ _RE_VES_THRESHOLD_GENERAL = re.compile(
 _RE_VES_FORMULA = re.compile(
     r"кг[^\n]*?\*[ \t]*(\d+(?:[.,]\d+)?)[ \t]*грн", re.IGNORECASE
 )
-_RE_VES_BARE = re.compile(r"\b(?:вес\w*|ваг\w*)[:\s]*(\d+(?:[.,]\d+)?)\b", re.IGNORECASE)
+_RE_VES_BARE = re.compile(r"\b(?:вес\w*|ваг\w*)[:\s]*(\d+(?:[.,]\d+)?)", re.IGNORECASE)
+# То, что идёт СРАЗУ после числа в _RE_VES_BARE - если это единица веса
+# груза (кг/тонни), число описывает вес самого груза ("середня вага 8
+# кг", "вага 2.3тони"), а НЕ ставку грн/кг - тогда _RE_VES_BARE не
+# должен сработать (см. _apply_keyword_overrides). Проверяется ОТДЕЛЬНЫМ
+# re.match по остатку строки (не встроенным lookahead) специально, чтобы
+# не зависеть от бэктрекинга необязательной дробной части числа - иначе
+# при "2.3тони" движок мог тихо "усечь" число до "2" и пропустить
+# проверку (реальный найденный баг при первой версии этого фикса).
+_RE_VES_UNIT_AFTER = re.compile(r"\s*(?:кг\w*|т(?:онн\w*|он\w*)?\b)", re.IGNORECASE)
 _COMBO_ETAZH_PROHOD_WORD = r"(?:прохід\w*|проход\w*|поверх\w*|этаж\w*)"
 _RE_PROHOD_ETAZH_COMBINED = re.compile(
     rf"{_COMBO_ETAZH_PROHOD_WORD}[ \t]*/[ \t]*{_COMBO_ETAZH_PROHOD_WORD}"
@@ -851,6 +860,13 @@ def _apply_keyword_overrides(result: dict, order_text: str):
                 result["_ves_trusted"] = True
         else:
             m = _RE_VES_BARE.search(order_text or "")
+            # Реальный кейс 19.08: "...(середня вага 8 кг)"/"вага 2.3тони"
+            # - число тут описывает вес самого ГРУЗА, не ставку грн/кг.
+            # Если сразу после числа (без учёта пробела) идёт единица
+            # веса ("кг"/"тонни"/"т") - это НЕ ставка, пропускаем совсем
+            # (в отличие от "вага 8грн", где сразу после числа - деньги).
+            if m and _RE_VES_UNIT_AFTER.match(order_text or "", m.end(1)):
+                m = None
             if m:
                 # Самый простой случай: "вес 5" / "вага 5" голым числом,
                 # без порога и без формулы (реальный кейс: "этажи/проходы
@@ -1329,6 +1345,35 @@ def _strip_bogus_km(result: dict, order_text: str):
     neponyatno = list(result.get("neponyatno") or [])
     neponyatno.append(f"{_fmt_num(km)}: ГБ?/точка?")
     result["neponyatno"] = neponyatno
+
+
+def _strip_bogus_ves(result: dict, order_text: str):
+    """Реальные кейсы (19.08): текст описывает вес самого груза, а не
+    ставку за кг - "...(середня вага 8 кг)" (вес одной коробки) или
+    "Профіль 7м, вага 2.3тони" (вес всього вантажу) - GPT всё равно
+    придумывал из этого поле 'Вес: N грн/кг', хотя ни разу цена за кг
+    в тексте не упоминалась. Ещё один реальный кейс - вес был указан
+    прямо в тексте ("вага 8грн" рядом со строкой вантажників), но
+    старый regex его вообще не ловил (см. _RE_VES_BARE) - GPT в этом
+    случае молчал, поле оставалось пустым, хотя деньги были явно
+    указаны.
+
+    Наши собственные regex-правила (_RE_VES_THRESHOLD_GENERAL/
+    _RE_VES_FORMULA/_RE_VES_BARE в _apply_keyword_overrides, плюс
+    позиционные шаблоны Виталия/мультилайн) ставят флаг '_ves_trusted',
+    когда САМИ нашли текстовую основу именно для СТАВКИ (не для веса
+    груза). Если флага нет - значит поле 'ves' пришло только от GPT без
+    проверенной текстовой основы - убираем, не додумываем деньги.
+
+    ВАЖНО: флаг не 'pop', а просто читаем ('get') - он ещё нужен ниже по
+    цепочке в _strip_ves_when_gruzchiki (та защита отдельно закрывает
+    другой кейс - путаницу с числами из строки вантажників - и сама
+    снимает флаг в конце)."""
+    if result.get("_ves_trusted", False):
+        return
+    tj = result.setdefault("tariff_json", {})
+    if tj.get("ves"):
+        tj["ves"] = None
 
 
 _RE_KOM_PERCENT_GENERAL = re.compile(r"ком[:\s]*(\d+(?:[.,]\d+)?)[ \t]*%", re.IGNORECASE)
@@ -1964,6 +2009,7 @@ def parse_tariff_via_gpt(order_text: str) -> dict:
         _strip_client_pays_from_kom(result, order_text)
         _recover_kom_percent_if_missing(result, order_text)
         _strip_bogus_km(result, order_text)
+        _strip_bogus_ves(result, order_text)
         result["neponyatno"] = _filter_neponyatno(result)
         _strip_bogus_gidrobort(result)
         _strip_bogus_dop_tochka_without_word(result, order_text)

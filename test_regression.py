@@ -70,6 +70,7 @@ def run_deterministic_pipeline(start_result: dict, order_text: str) -> dict:
     db._strip_client_pays_from_kom(result, order_text)
     db._recover_kom_percent_if_missing(result, order_text)
     db._strip_bogus_km(result, order_text)
+    db._strip_bogus_ves(result, order_text)
     result["neponyatno"] = db._filter_neponyatno(result)
     db._strip_bogus_gidrobort(result)
     db._strip_bogus_dop_tochka_without_word(result, order_text)
@@ -450,6 +451,55 @@ run_case(
     start_result={"avto_baza": 4500, "avto_dop_chas": 1000, "neponyatno": ["500: ГБ?/точка?/км?"]},
     must_contain=["Доп.точка: +500 грн"],
     must_not_contain=["Доп.ходка", "не понял"],
+)
+
+# ============================================================================
+# 8. Вес vs вес груза (регрессия 19.08 - три реальных случая из одной сессии)
+# ============================================================================
+
+run_case(
+    "Вес: 'вага Nгрн' слитно с грн (раньше пропускался целиком)",
+    order_text=(
+        "Вадим Город\n20.08 на 13:00\nЗайнятість: 3\\5год\nАвто:5Т+ГБ + 4 вантажника\n\n"
+        "Т1 Владислава Заремби 24\nТ2 Гарета Джонса 11/2\n4 дивани монітори пуфи генератор\n\n"
+        "Ком:800грн\nТариф:3850/900\nВантажники:2800/1400 вага 8грн\n"
+        "Клієнт:+380664638381\nМенеджер: Тимур @TK_GOR0D"
+    ),
+    start_result={"avto_baza": 3850, "avto_dop_chas": 900, "min_chasov": 3,
+                  "gruzchiki_baza": 2800, "gruzchiki_dop_chas": 1400,
+                  "kom_avto": {"znachenie": 800, "tip": "сумма"}, "forma_oplaty": "нал"},
+    must_contain=["Вес: 8 грн/кг"],
+)
+
+run_case(
+    "Вес: 'середня вага 8 кг' - это вес коробки, НЕ ставка - не выдумываем",
+    order_text=(
+        "Вадим Город\n21.08 на 12:00\nЗайнятість:6год\nАвто:5Т\n\n"
+        "Т1 Київська обл., Бровари, вул.Олега Оникиенка, 61\n"
+        "Т2 м.Київ, вул.Сім'ї Прахових, 54\n"
+        "Завантаження коробок/архів – 700 шт, розмір 33-27-40 (середня вага 8 кг)\n\n"
+        "Тариф 3800/950 +км 65грн БН Замовлення Мурах, оплату з клієнта не брати\n"
+        "Менеджер: Тимур @TK_GOR0D"
+    ),
+    start_result={"avto_baza": 3800, "avto_dop_chas": 950, "min_chasov": 3,
+                  "tariff_json": {"km_stavka": 65}, "forma_oplaty": "БН", "platelshik": "Диспетчер"},
+    must_not_contain=["Вес:"],
+)
+
+run_case(
+    "Вес: GPT придумал ставку из веса груза в тоннах ('вага 2.3тони') - убираем",
+    order_text=(
+        "20.08 до 15:00 завантажитись Авто від 7м+верх+бік Ориентир 2ч\n\n"
+        "Тар 9500/1200\nКом 10%\nОплата от диспетчера\n\n"
+        "Т1 Димер, вул.Вишнева 22б\nТ2 Межигірська 78\n"
+        "Профіль 7м, вага 2.3тони\nЗавантаження верхнє, вивантаження бокове"
+    ),
+    # GPT в реальном случае сам придумал ves=2 - имитируем это через start_result,
+    # т.к. в тексте нет НИ ОДНОГО текстового триггера ставки за кг.
+    start_result={"avto_baza": 9500, "avto_dop_chas": 1200,
+                  "kom_avto": {"znachenie": 10, "tip": "%"}, "platelshik": "Диспетчер", "forma_oplaty": "БН",
+                  "tariff_json": {"ves": {"tip": "ploskaya", "stavka": 2}}},
+    must_not_contain=["Вес:"],
 )
 
 # ============================================================================
