@@ -60,6 +60,8 @@ def run_deterministic_pipeline(start_result: dict, order_text: str) -> dict:
     db._apply_vitaliya_gruzchiki_template(result, order_text)
     db._apply_combined_avto_gruzchiki_template(result, order_text)
     db._apply_avto_gruzchiki_multiline_template(result, order_text)
+    db._apply_generic_combined_avto_gruzchiki(result, order_text)
+    db._apply_per_loader_rate_formats(result, order_text)
     db._apply_keyword_overrides(result, order_text)
     db._recover_avto_dop_chas(result, order_text)
     db._fix_kom_duplicating_dop_chas(result, order_text)
@@ -79,6 +81,7 @@ def run_deterministic_pipeline(start_result: dict, order_text: str) -> dict:
     db._strip_implausible_gidrobort(result, order_text)
     db._strip_implausible_etazhi_prohody(result, order_text)
     db._normalize_forma_oplaty(result, order_text)
+    db._route_combined_extra_numbers(result)
     db._reconcile_neponyatno(result)
     db._apply_hodka_context_to_dop_tochka(result, order_text)
     db._split_gruzchiki_dopy_by_plausibility(result)
@@ -500,6 +503,86 @@ run_case(
                   "kom_avto": {"znachenie": 10, "tip": "%"}, "platelshik": "Диспетчер", "forma_oplaty": "БН",
                   "tariff_json": {"ves": {"tip": "ploskaya", "stavka": 2}}},
     must_not_contain=["Вес:"],
+)
+
+# ============================================================================
+# 9. Комбинированный тариф авто+грузчики (регрессия 22.08)
+# ============================================================================
+
+run_case(
+    "Комбинированный тариф: 'Тар X/Y/Z' без отдельной строки грузчиков",
+    order_text=(
+        "22.08 15:00 Авто 3т + два грузчика\n\nТ1 Гатне\n\nТ2 Гатне \n\n"
+        "Тар 2ч 5000/2000/20 \nком 20%\nОплата от диспетчера \n\n0967571980 Марина"
+    ),
+    start_result={"avto_baza": 5000, "avto_dop_chas": 2000, "min_chasov": 2,
+                  "kom_avto": {"znachenie": 20, "tip": "%"}, "platelshik": "Диспетчер",
+                  "neponyatno": ["20: ГБ?/точка?/км?"]},
+    must_contain=["Авто+грузчики: 5000 (2ч)/2000", "Этажи: 20 грн", "Проходы: 20 грн"],
+    must_not_contain=["Грузчики:", "не понял"],
+)
+
+run_case(
+    "Комбинированный тариф: 'км по Xгрн' (реверс слово-потом-число) вне Виталия-шаблона",
+    order_text=(
+        "Зайнятість: 3год+-\nАвто:Бус + 2 вантажника\n\nТ1 Бориспіль\nТ2 Оболонь\n\n"
+        "Тариф:3500/1600/25+заміський км по 65грн."
+    ),
+    start_result={"avto_baza": 3500, "avto_dop_chas": 1600, "min_chasov": 3,
+                  "neponyatno": ["25: ГБ?/точка?/км?"]},
+    must_contain=["Авто+2 грузчика: 3500 (3ч)/1600", "Км: 65 грн/км", "Этажи: 25 грн", "Проходы: 25 грн"],
+    must_not_contain=["Грузчики:", "не понял"],
+)
+
+run_case(
+    "Комбинированный тариф НЕ срабатывает, если есть отдельная строка грузчиков",
+    order_text="5т + 4 вантажники\nАвто 5300/900\nГрузчики 1600/800\nКом 10%",
+    start_result={"avto_baza": 5300, "avto_dop_chas": 900, "min_chasov": 3,
+                  "gruzchiki_baza": 1600, "gruzchiki_dop_chas": 800,
+                  "kom_avto": {"znachenie": 10, "tip": "%"}},
+    must_contain=["Авто: 5300 (3ч)/900", "Грузчики: 1600 (2ч)/800"],
+    must_not_contain=["Авто+"],
+)
+
+# ============================================================================
+# 10. Ставка за 1 грузчика из общей/готовой цифры (регрессия 22.08)
+# ============================================================================
+
+run_case(
+    "Грузчики: общая сумма на бригаду 'BASE на Nч/DOP/EXTRA эт' делится на кол-во из шапки",
+    order_text=(
+        "🚦22.08 на 8:00\n5т +2 грузчика только на загрузку+1 пассажир\n⏰ Занятость 8ч\n"
+        "Т1 Киев, Игоря Турчина 2/17, 4 под , кв 58 (5 эт без лифта)\nТ2 Теплик, Винницкая область, вул\n"
+        "Переезд 2-х комнатной квартиры\nПредоплата 50% на загрузке\nКом 10%\nТариф\n"
+        "Авто 24800/950 (300км*70+3800)\nГрузчики 2700 на 3 ч/900/30 эт\n0982109311"
+    ),
+    # Намеренно "неверные" грузчики в start_result - имитируем, что GPT
+    # не поделил на бригаду (или вообще ошибся) - проверяем, что наша
+    # функция сама доверенно пересчитывает по количеству из шапки "+2
+    # грузчика", а не полагается на GPT.
+    start_result={"avto_baza": 24800, "avto_dop_chas": 950,
+                  "gruzchiki_baza": 2700, "gruzchiki_dop_chas": 900, "gruzchiki_chasov": None,
+                  "kom_avto": {"znachenie": 10, "tip": "%"},
+                  "neponyatno": ["2700: ГБ?/точка?/км?", "30: км?"]},
+    must_contain=["Грузчики: 1350 (3ч)/450", "Этажи: 30 грн"],
+    # "5 эт без лифта" в адресе точки загрузки - НЕ ставка на этажи,
+    # число из шапки/адреса не должно попадать в тариф.
+    must_not_contain=["Грузчики: 2700", "Этажи: 5 грн", "не понял"],
+)
+
+run_case(
+    "Грузчики: 'N грузчик RATE/час' - уже ставка за 1 человека, база = RATE*2ч",
+    order_text=(
+        "🛵22.08 на 9:00\n⏰ Занятость 5/6ч?\n5т с ГБ+4 грузчика\nТ1 Дорогожицкая 16\nТ2 Лысогорская 12а\n"
+        "Суть: 4/5т брусчатки (насыпью)\nКом 10%\n🧮Тариф Б/н\nАвто 4000/1000\n1 грузчик 450/час\n"
+        "0931499095 заказчик"
+    ),
+    start_result={"avto_baza": 4000, "avto_dop_chas": 1000,
+                  "gruzchiki_baza": None, "gruzchiki_dop_chas": 450, "gruzchiki_chasov": None,
+                  "kom_avto": {"znachenie": 10, "tip": "%"},
+                  "neponyatno": ["450: ГБ?/точка?/км?"]},
+    must_contain=["Грузчики: 900 (2ч)/450"],
+    must_not_contain=["не понял"],
 )
 
 # ============================================================================
