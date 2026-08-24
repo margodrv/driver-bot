@@ -622,7 +622,10 @@ def find_pending_neponyatno_value(tariff: dict, field_key: str):
     return matches[0] if len(matches) == 1 else None
 
 
-_LOADER_TEXT_RE = re.compile(r"(?<![а-яіїєґ])вантаж\w*|(?<![а-яіїєґ])груз\w*", re.IGNORECASE)
+_LOADER_TEXT_RE = re.compile(
+    r"(?<![а-яіїєґ])вантаж\w*|(?<![а-яіїєґ])груз\w*|(?<![а-яіїєґ])вант(?![а-яіїєґ])",
+    re.IGNORECASE,
+)
 
 
 _VITALIYA_RE = re.compile(r"виталия", re.IGNORECASE)
