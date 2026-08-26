@@ -12,6 +12,7 @@ from openai import OpenAI
 from aiohttp import web
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -622,10 +623,7 @@ def find_pending_neponyatno_value(tariff: dict, field_key: str):
     return matches[0] if len(matches) == 1 else None
 
 
-_LOADER_TEXT_RE = re.compile(
-    r"(?<![а-яіїєґ])вантаж\w*|(?<![а-яіїєґ])груз\w*|(?<![а-яіїєґ])вант(?![а-яіїєґ])",
-    re.IGNORECASE,
-)
+_LOADER_TEXT_RE = re.compile(r"(?<![а-яіїєґ])вантаж\w*|(?<![а-яіїєґ])груз\w*", re.IGNORECASE)
 
 
 _VITALIYA_RE = re.compile(r"виталия", re.IGNORECASE)
@@ -751,16 +749,7 @@ _RE_VES_THRESHOLD_GENERAL = re.compile(
 _RE_VES_FORMULA = re.compile(
     r"кг[^\n]*?\*[ \t]*(\d+(?:[.,]\d+)?)[ \t]*грн", re.IGNORECASE
 )
-_RE_VES_BARE = re.compile(r"\b(?:вес\w*|ваг\w*)[:\s]*(\d+(?:[.,]\d+)?)", re.IGNORECASE)
-# То, что идёт СРАЗУ после числа в _RE_VES_BARE - если это единица веса
-# груза (кг/тонни), число описывает вес самого груза ("середня вага 8
-# кг", "вага 2.3тони"), а НЕ ставку грн/кг - тогда _RE_VES_BARE не
-# должен сработать (см. _apply_keyword_overrides). Проверяется ОТДЕЛЬНЫМ
-# re.match по остатку строки (не встроенным lookahead) специально, чтобы
-# не зависеть от бэктрекинга необязательной дробной части числа - иначе
-# при "2.3тони" движок мог тихо "усечь" число до "2" и пропустить
-# проверку (реальный найденный баг при первой версии этого фикса).
-_RE_VES_UNIT_AFTER = re.compile(r"\s*(?:кг\w*|т(?:онн\w*|он\w*)?\b)", re.IGNORECASE)
+_RE_VES_BARE = re.compile(r"\b(?:вес\w*|ваг\w*)[:\s]*(\d+(?:[.,]\d+)?)\b", re.IGNORECASE)
 _COMBO_ETAZH_PROHOD_WORD = r"(?:прохід\w*|проход\w*|поверх\w*|этаж\w*)"
 _RE_PROHOD_ETAZH_COMBINED = re.compile(
     rf"{_COMBO_ETAZH_PROHOD_WORD}[ \t]*/[ \t]*{_COMBO_ETAZH_PROHOD_WORD}"
@@ -835,12 +824,6 @@ def _apply_keyword_overrides(result: dict, order_text: str):
         tj["prochie_dopy"] = prochie
 
     m = _RE_KM_GENERAL.search(order_text or "")
-    if not m:
-        # Реальный кейс (22.08): "заміський км по 65грн" - слово "км"
-        # стоит ПЕРЕД ценой, а не после ("X грн/км") - раньше это вообще
-        # не ловилось нигде, кроме узкой Виталия-специфичной функции
-        # (_RE_KM_PO). Теперь работает для любого заказа.
-        m = _RE_KM_PO.search(order_text or "")
     if m:
         val = float(m.group(1).replace(",", "."))
         tj["km_stavka"] = val
@@ -869,13 +852,6 @@ def _apply_keyword_overrides(result: dict, order_text: str):
                 result["_ves_trusted"] = True
         else:
             m = _RE_VES_BARE.search(order_text or "")
-            # Реальный кейс 19.08: "...(середня вага 8 кг)"/"вага 2.3тони"
-            # - число тут описывает вес самого ГРУЗА, не ставку грн/кг.
-            # Если сразу после числа (без учёта пробела) идёт единица
-            # веса ("кг"/"тонни"/"т") - это НЕ ставка, пропускаем совсем
-            # (в отличие от "вага 8грн", где сразу после числа - деньги).
-            if m and _RE_VES_UNIT_AFTER.match(order_text or "", m.end(1)):
-                m = None
             if m:
                 # Самый простой случай: "вес 5" / "вага 5" голым числом,
                 # без порога и без формулы (реальный кейс: "этажи/проходы
@@ -1160,228 +1136,6 @@ def _apply_combined_avto_gruzchiki_template(result: dict, order_text: str):
     result["neponyatno"] = []
 
 
-_RE_SEPARATE_LOADERS_LINE = re.compile(r"(?:вантажник\w*|грузчик\w*)[:\s]*\d+(?:[.,]\d+)?", re.IGNORECASE)
-_RE_TAR_ALL_NUMBERS = re.compile(
-    r"тар(?:иф)?[:\s]*(?:\d+(?:[.,]\d+)?[ \t]*ч[а-яё]*[ \t]*)?"
-    r"((?:\d+(?:[.,]\d+)?[ \t]*/[ \t]*)+\d+(?:[.,]\d+)?)",
-    re.IGNORECASE,
-)
-
-
-def _apply_generic_combined_avto_gruzchiki(result: dict, order_text: str):
-    """Подтверждено логистом-владельцем (22.08): тариф в заявке бывает
-    либо РАЗДЕЛЬНЫМ (у авто своя строка "Тар X/Y", у грузчиков отдельная
-    строка со своими числами), либо ОБЩИМ - ОДНА строка "Тар X/Y/Z..."
-    сразу на авто+грузчиков вместе, без отдельной строки грузчиков
-    вообще. Реальный пример: "Авто 3т + два грузчика ... Тар 2ч
-    5000/2000/20" - 5000/2000 это ОБЩАЯ ставка на авто+грузчиков вместе
-    (не авто отдельно), а 20 - "допы" (дальше классифицируется тем же
-    правилом, что и лишние числа у грузчиков, см.
-    _split_gruzchiki_dopy_by_plausibility).
-
-    Отличительный признак (подтверждён): грузчики упомянуты ТОЛЬКО в
-    строке "Авто ..." (типа "Авто 3т + два грузчика"/"Авто:Бус + 2
-    вантажника"), и нигде в тексте больше НЕТ отдельной строки
-    "Грузчики"/"Вантажники" со своими числами - см.
-    _RE_SEPARATE_LOADERS_LINE (слово вантажник/грузчик, СРАЗУ ЗА
-    которым идёт число - в отличие от простого упоминания count'а ПЕРЕД
-    словом в шапке типа "2 вантажника", что этому паттерну не
-    соответствует и не считается отдельной строкой).
-
-    Как и в узкоспециализированном _apply_combined_avto_gruzchiki_template
-    (там - только для конкретной формулировки Виталии) - НЕ создаём
-    отдельную строку "Грузчики", просто переименовываем "Авто" в
-    "Авто+N грузчика" в превью (через _combined_avto_label).
-
-    Срабатывает ТОЛЬКО если ни один более специфичный шаблон выше по
-    цепочке уже не назначил грузчикам отдельную базу (`gruzchiki_baza`
-    всё ещё пусто) - иначе не рискуем перезаписывать более точную
-    логику.
-
-    ВАЖНО: третье и дальнейшие числа (если есть) тут НЕ трогаем сразу -
-    только откладываем в `_combined_extra_numbers` про запас. Раздать их
-    по местам (вес/этажи+проходы) нужно ПОСЛЕ _apply_keyword_overrides -
-    иначе рискуем задвоить число, у которого уже есть свой явный
-    словесный триггер в тексте (реальная регрессия при первой версии
-    фикса: "Тар 7800/2400/25поверх" - "поверх" рядом с 25 уже даёт
-    Этажи=25 через _apply_keyword_overrides, а если параллельно закинуть
-    то же 25 в gruzchiki_dopy - _split_gruzchiki_dopy_by_plausibility
-    увидит, что этажи уже заняты другим числом, и ошибочно попросит
-    уточнить то же самое число как "не понял"). См.
-    _route_combined_extra_numbers ниже по цепочке.
-    """
-    if result.get("gruzchiki_baza") is not None:
-        return  # более специфичный шаблон/GPT уже разобрался - не лезем
-    if not _LOADER_TEXT_RE.search(order_text or ""):
-        return  # грузчики вообще не упомянуты - обычный случай авто-only
-    if _RE_SEPARATE_LOADERS_LINE.search(order_text or ""):
-        return  # есть отдельная строка с ценой грузчиков - тариф раздельный
-
-    m = _RE_TAR_ALL_NUMBERS.search(order_text or "")
-    if not m:
-        return
-    numbers = [float(n.replace(",", ".")) for n in m.group(1).split("/")]
-    if len(numbers) < 2:
-        return  # меньше двух чисел - не похоже на "база/доп_час", не рискуем
-
-    result["avto_baza"] = numbers[0]
-    result["avto_dop_chas"] = numbers[1]
-    result["tip_rascheta"] = "почасовка"
-    result["gruzchiki_baza"] = None
-    result["gruzchiki_dop_chas"] = None
-    result["_combined_extra_numbers"] = numbers[2:]
-
-    lc = _RE_LOADER_COUNT_PLUS.search(order_text or "")
-    result["_combined_avto_label"] = f"Авто+{lc.group(1)} грузчика" if lc else "Авто+грузчики"
-
-
-def _route_combined_extra_numbers(result: dict):
-    """Вторая половина _apply_generic_combined_avto_gruzchiki - забирает
-    числа, отложенные в `_combined_extra_numbers`, и раздаёт по полям
-    (вес/этажи+проходы), но ТОЛЬКО те, что ещё НИКУДА не попали к этому
-    моменту (после _apply_keyword_overrides и всех защит/восстановлений
-    выше по цепочке) - если число уже стало km_stavka/etazhi_stavka/
-    prohody_stavka/dop_tochka/gidrobort/ves/именной допой через явный
-    словесный триггер в тексте - не трогаем его повторно."""
-    extra = result.pop("_combined_extra_numbers", None)
-    if not extra:
-        return
-    tj = result.setdefault("tariff_json", {})
-
-    already_used = {result.get("avto_baza"), result.get("avto_dop_chas"),
-                     result.get("gruzchiki_baza"), result.get("gruzchiki_dop_chas")}
-    for key in ("km_stavka", "etazhi_stavka", "prohody_stavka"):
-        v = tj.get(key)
-        if v is not None:
-            already_used.add(v)
-    for key in ("dop_tochka", "gidrobort"):
-        d = tj.get(key)
-        if d and d.get("summa") is not None:
-            already_used.add(d["summa"])
-    ves = tj.get("ves")
-    if ves and ves.get("stavka") is not None:
-        already_used.add(ves["stavka"])
-    for dop in tj.get("prochie_dopy") or []:
-        if dop.get("summa") is not None:
-            already_used.add(dop["summa"])
-
-    unclaimed = [v for v in extra if v not in already_used]
-    if not unclaimed:
-        return
-
-    dopy = list(result.get("gruzchiki_dopy") or [])
-    dopy.extend(unclaimed)
-    result["gruzchiki_dopy"] = dopy
-
-    # GPT (следуя своей же инструкции про "третье число без ключевого
-    # слова рядом") обычно уже успел положить эти же числа в neponyatno
-    # как "N: ГБ?/точка?/км?" - раз мы их только что классифицировали
-    # (они уйдут в вес/этажи+проходы чуть позже, см.
-    # _split_gruzchiki_dopy_by_plausibility), убираем дублирующее
-    # предупреждение сразу - общий дедуп ниже по цепочке тут не сработал
-    # бы, он завязан на gruzchiki_baza, а у нас оно намеренно пустое
-    # (комбинированный тариф - без отдельной строки "Грузчики").
-    unclaimed_strs = {_fmt_num(v) for v in unclaimed}
-    kept = []
-    for item in result.get("neponyatno") or []:
-        m2 = _NEPONYATNO_ITEM_RE.match(item)
-        if m2 and m2.group(1) in unclaimed_strs:
-            continue
-        kept.append(item)
-    result["neponyatno"] = kept
-
-
-_RE_LOADER_LUMP_HOURS = re.compile(
-    r"(?:вантажник\w*|грузчик\w*)[:\s]*(\d+(?:[.,]\d+)?)[ \t]*на[ \t]*(\d+(?:[.,]\d+)?)[ \t]*ч[а-яё]*"
-    r"[ \t]*/[ \t]*(\d+(?:[.,]\d+)?)"
-    r"(?:[ \t]*/[ \t]*(\d+(?:[.,]\d+)?)[ \t]*(поверх\w*|эт\w*))?",
-    re.IGNORECASE,
-)
-_RE_LOADER_SINGLE_RATE = re.compile(
-    r"\b1[ \t]*(?:вантажник\w*|грузчик\w*)[ \t]*(\d+(?:[.,]\d+)?)[ \t]*/[ \t]*час", re.IGNORECASE
-)
-
-
-def _apply_per_loader_rate_formats(result: dict, order_text: str):
-    """Подтверждено логистом-владельцем (22.08): бывает два формата, где
-    цена грузчиков в тексте указана НЕ "за одного", а либо (А) общей
-    суммой на всю бригаду, либо (Б) уже готовой ставкой за 1 человека -
-    в обоих случаях детерминированно приводим к "ставка на 1 грузчика",
-    как и везде в остальном боте.
-
-    Формат А - "Грузчики BASE на Nч/DOP[/EXTRA эт]" - BASE и DOP тут
-    ОБЩИЕ на всю бригаду (не на одного человека). Подтверждено явно:
-    "база тоже делится на грузчиков" - делим ОБА числа на количество
-    грузчиков из шапки заказа (например "5т +2 грузчика" -> 2). Без
-    явного количества в шапке не рискуем угадывать - оставляем как есть.
-    Реальный пример (22.08): "Грузчики 2700 на 3 ч/900/30 эт" при "+2
-    грузчика" в шапке -> база 1350 (2700/2), доп.час 450 (900/2), часов
-    3, этажи 30 (лишнее число тут ВСЕГДА "поверх"/"эт" - число идёт
-    сразу следом за доп.часом через "/", а не где-то ещё в тексте, так
-    что не путаем с посторонним "N эт" в описании адреса, например "5
-    эт без ліфта" у точки завантаження).
-
-    Формат Б - "1 грузчик RATE/час" - RATE тут УЖЕ ставка за 1 человека
-    (количество грузчиков явно "1", делить не на что). Подтверждено:
-    "база у грузчиков всегда 2 часа" - т.к. явной базы в этом формате
-    нет вообще (только почасовая ставка), синтезируем её как RATE*2,
-    чтобы строка "Грузчики:" в превью не пропала (она рендерится только
-    когда gruzchiki_baza не пусто). Пока подтверждено только для
-    буквально "1 грузчик" - для другого количества с этой формулировкой
-    не обобщаем, ждём отдельного подтверждения.
-
-    Оба формата - это ОТДЕЛЬНАЯ строка грузчиков (не комбинированный
-    тариф авто+грузчики) - поэтому применяется ПОСЛЕ
-    _apply_generic_combined_avto_gruzchiki (которая на такой текст и
-    так не сработает - _RE_SEPARATE_LOADERS_LINE отловит "грузчик
-    2700"/"грузчик 450" как отдельную строку).
-    """
-    tj = result.setdefault("tariff_json", {})
-
-    m = _RE_LOADER_LUMP_HOURS.search(order_text or "")
-    if m:
-        lc = _RE_LOADER_COUNT_PLUS.search(order_text or "")
-        if not lc:
-            return  # без явного количества в шапке не делим - не рискуем угадать
-        headcount = int(lc.group(1))
-        if headcount < 1:
-            return
-        baza_total = float(m.group(1).replace(",", "."))
-        hours = float(m.group(2).replace(",", "."))
-        dop_total = float(m.group(3).replace(",", "."))
-
-        result["gruzchiki_baza"] = round(baza_total / headcount, 2)
-        result["gruzchiki_dop_chas"] = round(dop_total / headcount, 2)
-        result["gruzchiki_chasov"] = hours
-        result["gruzchiki_dopy"] = []
-
-        used = {_fmt_num(baza_total), _fmt_num(hours), _fmt_num(dop_total)}
-        if m.group(4):
-            extra = float(m.group(4).replace(",", "."))
-            tj["etazhi_stavka"] = extra
-            used.add(_fmt_num(extra))
-
-        result["neponyatno"] = [
-            item for item in (result.get("neponyatno") or [])
-            if not (m2 := _NEPONYATNO_ITEM_RE.match(item)) or m2.group(1) not in used
-        ]
-        return
-
-    m = _RE_LOADER_SINGLE_RATE.search(order_text or "")
-    if m:
-        rate = float(m.group(1).replace(",", "."))
-        result["gruzchiki_chasov"] = 2
-        result["gruzchiki_dop_chas"] = rate
-        result["gruzchiki_baza"] = round(rate * 2, 2)
-        result["gruzchiki_dopy"] = []
-
-        used = {_fmt_num(rate)}
-        result["neponyatno"] = [
-            item for item in (result.get("neponyatno") or [])
-            if not (m2 := _NEPONYATNO_ITEM_RE.match(item)) or m2.group(1) not in used
-        ]
-
-
 def _apply_vitaliya_gruzchiki_template(result: dict, order_text: str):
     """Второй подтверждённый шаблон источника 'Виталия' (отличается от
     санобработки выше): "Тар БН Авто X/Y грузчики A/B/C/D/E" - семь
@@ -1576,35 +1330,6 @@ def _strip_bogus_km(result: dict, order_text: str):
     neponyatno = list(result.get("neponyatno") or [])
     neponyatno.append(f"{_fmt_num(km)}: ГБ?/точка?")
     result["neponyatno"] = neponyatno
-
-
-def _strip_bogus_ves(result: dict, order_text: str):
-    """Реальные кейсы (19.08): текст описывает вес самого груза, а не
-    ставку за кг - "...(середня вага 8 кг)" (вес одной коробки) или
-    "Профіль 7м, вага 2.3тони" (вес всього вантажу) - GPT всё равно
-    придумывал из этого поле 'Вес: N грн/кг', хотя ни разу цена за кг
-    в тексте не упоминалась. Ещё один реальный кейс - вес был указан
-    прямо в тексте ("вага 8грн" рядом со строкой вантажників), но
-    старый regex его вообще не ловил (см. _RE_VES_BARE) - GPT в этом
-    случае молчал, поле оставалось пустым, хотя деньги были явно
-    указаны.
-
-    Наши собственные regex-правила (_RE_VES_THRESHOLD_GENERAL/
-    _RE_VES_FORMULA/_RE_VES_BARE в _apply_keyword_overrides, плюс
-    позиционные шаблоны Виталия/мультилайн) ставят флаг '_ves_trusted',
-    когда САМИ нашли текстовую основу именно для СТАВКИ (не для веса
-    груза). Если флага нет - значит поле 'ves' пришло только от GPT без
-    проверенной текстовой основы - убираем, не додумываем деньги.
-
-    ВАЖНО: флаг не 'pop', а просто читаем ('get') - он ещё нужен ниже по
-    цепочке в _strip_ves_when_gruzchiki (та защита отдельно закрывает
-    другой кейс - путаницу с числами из строки вантажників - и сама
-    снимает флаг в конце)."""
-    if result.get("_ves_trusted", False):
-        return
-    tj = result.setdefault("tariff_json", {})
-    if tj.get("ves"):
-        tj["ves"] = None
 
 
 _RE_KOM_PERCENT_GENERAL = re.compile(r"ком[:\s]*(\d+(?:[.,]\d+)?)[ \t]*%", re.IGNORECASE)
@@ -1951,22 +1676,18 @@ def _reconcile_neponyatno(result: dict):
 
 
 def _split_gruzchiki_dopy_by_plausibility(result: dict):
-    """Подтверждено: число ≤14 среди 'лишних' чисел грузчиков (например
+    """Подтверждено: число ≤15 среди 'лишних' чисел грузчиков (например
     '1600/800/4/20' - 4 и 20 сверх базы/доп.часа) может быть ТОЛЬКО
     весом - другие категории (этаж/проход/км/рокла) никогда не бывают
     такими маленькими. Такие числа классифицируются в вес автоматически,
     без вопроса.
 
-    Число от 15 и больше (например тот же '20') - ОБЩАЯ ставка сразу на
+    Число больше 15 (например тот же '20') - ОБЩАЯ ставка сразу на
     этажи И проходы вместе (аналогично общему слову "допи" в тексте),
     даже без слов-подсказок рядом: "мы не знаем что именно будет, но
     клиент предупреждён о стоимости" - подтверждено логистом-владельцем
     как правило именно для ЭТОГО контекста (лишние числа в строке
     грузчиков), автоматически, без переспроса через кнопку.
-
-    Порог сдвинут с ≤15 на ≤14 (22.08, подтверждено логистом-владельцем) -
-    "15" само по себе теперь считается слишком большим для веса, уходит
-    в этажи/проходы.
     """
     dopy = result.get("gruzchiki_dopy") or []
     if not dopy:
@@ -1976,9 +1697,9 @@ def _split_gruzchiki_dopy_by_plausibility(result: dict):
     neponyatno = list(result.get("neponyatno") or [])
     etazh_prohod_assigned = tj.get("etazhi_stavka") is not None or tj.get("prohody_stavka") is not None
     for val in dopy:
-        if val <= 14 and not tj.get("ves"):
+        if val <= 15 and not tj.get("ves"):
             tj["ves"] = {"tip": "ploskaya", "stavka": val}
-        elif val <= 14:
+        elif val <= 15:
             remaining.append(val)  # вес уже занят другим числом - редкий случай, оставляем как есть
         elif not etazh_prohod_assigned:
             tj["etazhi_stavka"] = val
@@ -1992,23 +1713,12 @@ def _split_gruzchiki_dopy_by_plausibility(result: dict):
     result["neponyatno"] = neponyatno
 
 
-# Общий "пропуск часов" между опорным словом ("Тар"/"Тариф"/"...авто")
-# и настоящим числом базы - покрывает и короткую форму ("3ч"), и полную
-# ("3 години"), с необязательным двоеточием между ними ("Тариф 3
-# години: 4000" - реальный кейс 24.08, см. проектный документ). Атомарен
-# как единый блок: если после найденного числа не идёт ни "ч...", ни
-# "годин...", вся группа целиком считается отсутствующей - число НЕ
-# "откусывается" от настоящей базы (см. раздел 9 п.7/9 документации).
-_RE_TAR_HOURS_SKIP = r"(?:\d+(?:[.,]\d+)?[ \t]*(?:ч[а-яё]*|годин\w*)[ \t]*:?[ \t]*)?"
-
 _RE_TAR_NUMBERS = re.compile(
-    r"тар(?:иф)?[:\s]*" + _RE_TAR_HOURS_SKIP +
-    r"(\d+(?:[.,]\d+)?)(?=[ \t]*(?:/|грн|\s|$))(?:[ \t]*/[ \t]*(\d+(?:[.,]\d+)?))?",
+    r"тар(?:иф)?[:\s]*(\d+(?:[.,]\d+)?)(?=[ \t]*(?:/|грн|\s|$))(?:[ \t]*/[ \t]*(\d+(?:[.,]\d+)?))?",
     re.IGNORECASE,
 )
 _RE_TAR_AVTO_NUMBERS = re.compile(
-    r"тар(?:иф)?[:\s]*\n?[ \t]*авто[ \t]*" + _RE_TAR_HOURS_SKIP +
-    r"(\d+(?:[.,]\d+)?)(?:[ \t]*/[ \t]*(\d+(?:[.,]\d+)?))?",
+    r"тар(?:иф)?[:\s]*\n?[ \t]*авто[ \t]*(\d+(?:[.,]\d+)?)(?:[ \t]*/[ \t]*(\d+(?:[.,]\d+)?))?",
     re.IGNORECASE,
 )
 
@@ -2245,8 +1955,6 @@ def parse_tariff_via_gpt(order_text: str) -> dict:
         _apply_vitaliya_gruzchiki_template(result, order_text)
         _apply_combined_avto_gruzchiki_template(result, order_text)
         _apply_avto_gruzchiki_multiline_template(result, order_text)
-        _apply_generic_combined_avto_gruzchiki(result, order_text)
-        _apply_per_loader_rate_formats(result, order_text)
         _apply_keyword_overrides(result, order_text)
         _recover_avto_dop_chas(result, order_text)
         _fix_kom_duplicating_dop_chas(result, order_text)
@@ -2257,7 +1965,6 @@ def parse_tariff_via_gpt(order_text: str) -> dict:
         _strip_client_pays_from_kom(result, order_text)
         _recover_kom_percent_if_missing(result, order_text)
         _strip_bogus_km(result, order_text)
-        _strip_bogus_ves(result, order_text)
         result["neponyatno"] = _filter_neponyatno(result)
         _strip_bogus_gidrobort(result)
         _strip_bogus_dop_tochka_without_word(result, order_text)
@@ -2266,7 +1973,6 @@ def parse_tariff_via_gpt(order_text: str) -> dict:
         _strip_implausible_gidrobort(result, order_text)
         _strip_implausible_etazhi_prohody(result, order_text)
         _normalize_forma_oplaty(result, order_text)
-        _route_combined_extra_numbers(result)
         _reconcile_neponyatno(result)
         _apply_hodka_context_to_dop_tochka(result, order_text)
         _split_gruzchiki_dopy_by_plausibility(result)
@@ -2872,6 +2578,19 @@ _order_author_line: dict[str, str] = {}
 # используется, чтобы пометить изменённые строки превью звёздочкой ⭐️.
 _order_edited_fields: dict[str, set] = {}
 
+# order_key -> (chat_id, message_id) уже ОТПРАВЛЕННОГО превью тарифа.
+# КРИТИЧНО (фикс 25.08, восстановлен повторно - см. README/сводку:
+# process_new_order раньше слал НОВОЕ сообщение безусловно при КАЖДОМ
+# вызове, а вызываться он может больше одного раза на один и тот же
+# order_key - правка заявки в Telegram (parsing-bot теперь шлёт
+# notify_dispatch_bot и на неё тоже), повторная доставка вебхука,
+# reply с медиафайлами, которые могут задеть обработчик на стороне
+# parsing-bot, и т.п. Без этого словаря каждый такой повторный вызов
+# плодил ДУБЛИРУЮЩЕЕСЯ превью в чате логиста вместо правки уже
+# существующего - живой кейс 25.08, заявка 'Вишгородська 44в' от Анни:
+# 4 отдельных превью подряд на один и тот же заказ.
+_sent_preview_message: dict[str, tuple] = {}
+
 # (chat_id, message_id превью-сообщения бота) -> (order_key, field_key).
 # Заполняется при нажатии кнопки конкретного поля в меню правки, чтобы
 # понять, какое поле правит логист, когда придёт текстовый reply.
@@ -3302,13 +3021,37 @@ async def process_new_order(tg_app: Application, order_key: str):
     _order_author_line[order_key] = author_line
 
     preview = build_tariff_preview(tariff, author_line)
+    keyboard = tariff_level1_keyboard(order_key)
 
-    await tg_app.bot.send_message(
+    sent = _sent_preview_message.get(order_key)
+    if sent:
+        sent_chat_id, sent_message_id = sent
+        try:
+            await tg_app.bot.edit_message_text(
+                chat_id=sent_chat_id,
+                message_id=sent_message_id,
+                text=preview,
+                reply_markup=keyboard,
+            )
+            log_event("Превью тарифа обновлено (повторный вызов)", chat_id, message_id, row_num)
+            return
+        except BadRequest as e:
+            if "message is not modified" in str(e).lower():
+                # правка заявки не задела ничего из текста превью - это успех,
+                # новое сообщение слать не нужно
+                log_event("Превью тарифа не изменилось (message is not modified)", chat_id, message_id, row_num)
+                return
+            # сообщение удалено вручную / бот терял память об этом заказе -
+            # безопасный фолбэк, шлём новое как раньше
+            logger.warning(f"Не удалось отредактировать превью для key={order_key}: {e} - шлю новое")
+
+    new_message = await tg_app.bot.send_message(
         chat_id=int(chat_id),
         text=preview,
         reply_to_message_id=int(message_id),
-        reply_markup=tariff_level1_keyboard(order_key),
+        reply_markup=keyboard,
     )
+    _sent_preview_message[order_key] = (new_message.chat_id, new_message.message_id)
     log_event("Превью тарифа отправлено", chat_id, message_id, row_num)
 
 
