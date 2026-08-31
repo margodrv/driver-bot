@@ -3567,15 +3567,27 @@ async def handle_new_order_webhook(request: web.Request):
 
     logger.info(f"Вебхук: новая заявка key={order_key}")
 
-    try:
-        await process_new_order(request.app["tg_app"], order_key)
-    except Exception as e:
-        logger.error(f"Ошибка обработки заявки key={order_key}: {e}")
-        log_event(f"Тариф: ОШИБКА обработки вебхука - {e}")
-        # Отвечаем 200 в любом случае - parsing-bot не должен ретраить и
-        # не должен ничего решать по коду ответа, это fire-and-forget.
+    async def _process_in_background():
+        try:
+            await process_new_order(request.app["tg_app"], order_key)
+        except Exception as e:
+            logger.error(f"Ошибка обработки заявки key={order_key}: {e}")
+            log_event(f"Тариф: ОШИБКА обработки вебхука - {e}")
 
-    return web.json_response({"ok": True})
+    # 31.08: раньше здесь стоял `await process_new_order(...)` - ответ на
+    # вебхук ждал ПОЛНОГО завершения обработки (Sheets read + GPT-разбор
+    # тарифа + Sheets write + отправка превью в Telegram). По логам
+    # parsing-bot за 31.08 (2.5 часа) это ВСЕГДА занимало больше 10 секунд
+    # (её собственный клиентский таймаут) - 8 из 8 попыток подряд ловили
+    # 'Read timed out', ни одной успешной. Поднимать таймаут на стороне
+    # parsing-bot дальше (3с -> 10с -> ?) не решение - проблема не в
+    # терпении клиента, а в том, что сама обработка объективно долгая.
+    # Теперь вебхук отвечает 200 СРАЗУ, а process_new_order уходит в фон
+    # отдельной задачей - так клиентский таймаут вообще перестаёт иметь
+    # значение, независимо от того, сколько реально займёт обработка.
+    asyncio.create_task(_process_in_background())
+
+    return web.json_response({"ok": True, "status": "processing"})
 
 
 async def process_new_order(tg_app: Application, order_key: str):
