@@ -942,6 +942,47 @@ run_case(
     must_contain=["Вес: 8 грн/кг", "Авто+4 грузчика: 6000", "Этажи: 50 грн", "Проходы: 50 грн", "Ком. 20%"],
     must_not_contain=["Вес: 240 грн/кг", "не понял"],
 )
+def test_no_author_tag_in_preview():
+    """Реальный кейс 02.09 - подтверждено логистом-владельцем как глюк:
+    "это глюк - так не нужно, в другой группе такого нет". Если в тексте
+    заявки есть строка вида "Логіст Яна @Yana_TK_Gorod" (обычная подпись
+    в заявке от контрагента, не адресация боту) - build_tariff_preview
+    раньше добавлял "@Yana_TK_Gorod" отдельной строкой ПЕРЕД "📋 Тариф по
+    заказу". Теперь эта строка НЕ должна попадать в текст превью, даже
+    если extract_order_author() её всё ещё находит (сама функция
+    осталась - author_line просто больше не рендерится)."""
+    global PASSED, FAILED
+    order_text = (
+        "🚦03.09 на 10:00\nзайнятість 2 год\nТ1 Андрія Верхогляда 12\n"
+        "Т2 Тетяна Яблонської 6\nТ3 Андрія Верхогляда 12\nбус + 2 вантажники \n"
+        "тариф: 3550/1350 + 30 допи\nоплата на місці\nком 10%\n0502779396\n"
+        "логіст Яна @Yana_TK_Gorod"
+    )
+    author_line = db.extract_order_author(order_text, "Анна")
+    tariff = {
+        "avto_baza": 3550, "avto_dop_chas": 1350, "min_chasov": 2,
+        "tariff_json": {"etazhi_stavka": 30, "prohody_stavka": 30},
+        "kom_avto": {"znachenie": 10, "tip": "%"}, "forma_oplaty": "Нал",
+    }
+    preview = db.build_tariff_preview(tariff, author_line)
+
+    problems = []
+    if "@Yana_TK_Gorod" in preview:
+        problems.append("НЕ ДОЛЖНО БЫТЬ (но есть): '@Yana_TK_Gorod' в превью")
+    if not preview.startswith("📋 Тариф по заказу"):
+        problems.append(f"ОЖИДАЛОСЬ: превью начинается с '📋 Тариф по заказу', получили: {preview.splitlines()[0]!r}")
+
+    name = "Тег логиста из текста заявки ('Логіст Яна @...') НЕ попадает в превью тарифа"
+    if problems:
+        FAILED += 1
+        FAILURES.append((name, preview, problems))
+        print(f"✗ {name}")
+    else:
+        PASSED += 1
+        print(f"✓ {name}")
+
+
+test_no_author_tag_in_preview()
 
 # ============================================================================
 # Итог
