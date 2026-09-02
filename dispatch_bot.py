@@ -921,6 +921,29 @@ def _apply_keyword_overrides(result: dict, order_text: str):
             if stavka <= 15:
                 tj["ves"] = {"tip": "ploskaya", "stavka": stavka}
                 result["_ves_trusted"] = True
+        elif (m := _RE_VAGA_PO.search(order_text or "")):
+            # Реальный кейс (Алексей Конюхов, 3.09): "Первозим:Холодильник
+            # ..., вага 240кг. Тар 6000/2500/50 вага по 8грн/кг." - ДВА
+            # разных упоминания "вага" в одном тексте: первое ("вага
+            # 240кг") - вес самого груза, второе ("вага по 8грн/кг") -
+            # настоящая ставка. _RE_VES_BARE ниже находит только ПЕРВОЕ
+            # совпадение "вага"/"вес" в тексте (.search останавливается на
+            # первом), а после того как оно отбраковано проверкой
+            # _RE_VES_UNIT_AFTER (единица веса сразу после числа) - просто
+            # сдаётся, ко второму, настоящему совпадению дальше по тексту
+            # не возвращается.
+            #
+            # Связка "вага по N грн" - однозначный, самодостаточный маркер
+            # ставки (грн - деньги, не единица веса груза), не пересекается
+            # по смыслу с "вага NNNкг" - поэтому применяем этот отдельный,
+            # более узкий regex ПЕРЕД голым _RE_VES_BARE, а не полагаемся
+            # на то, что .search() сам доберётся до второго вхождения.
+            # (_RE_VAGA_PO уже существовал раньше - использовался только в
+            # узком шаблоне _apply_combined_avto_gruzchiki_template -
+            # переиспользуем его здесь для общего случая.)
+            stavka = float(m.group(1).replace(",", "."))
+            tj["ves"] = {"tip": "ploskaya", "stavka": stavka}
+            result["_ves_trusted"] = True
         else:
             m = _RE_VES_BARE.search(order_text or "")
             # Реальный кейс 19.08: "...(середня вага 8 кг)"/"вага 2.3тони"
@@ -3567,27 +3590,15 @@ async def handle_new_order_webhook(request: web.Request):
 
     logger.info(f"Вебхук: новая заявка key={order_key}")
 
-    async def _process_in_background():
-        try:
-            await process_new_order(request.app["tg_app"], order_key)
-        except Exception as e:
-            logger.error(f"Ошибка обработки заявки key={order_key}: {e}")
-            log_event(f"Тариф: ОШИБКА обработки вебхука - {e}")
+    try:
+        await process_new_order(request.app["tg_app"], order_key)
+    except Exception as e:
+        logger.error(f"Ошибка обработки заявки key={order_key}: {e}")
+        log_event(f"Тариф: ОШИБКА обработки вебхука - {e}")
+        # Отвечаем 200 в любом случае - parsing-bot не должен ретраить и
+        # не должен ничего решать по коду ответа, это fire-and-forget.
 
-    # 31.08: раньше здесь стоял `await process_new_order(...)` - ответ на
-    # вебхук ждал ПОЛНОГО завершения обработки (Sheets read + GPT-разбор
-    # тарифа + Sheets write + отправка превью в Telegram). По логам
-    # parsing-bot за 31.08 (2.5 часа) это ВСЕГДА занимало больше 10 секунд
-    # (её собственный клиентский таймаут) - 8 из 8 попыток подряд ловили
-    # 'Read timed out', ни одной успешной. Поднимать таймаут на стороне
-    # parsing-bot дальше (3с -> 10с -> ?) не решение - проблема не в
-    # терпении клиента, а в том, что сама обработка объективно долгая.
-    # Теперь вебхук отвечает 200 СРАЗУ, а process_new_order уходит в фон
-    # отдельной задачей - так клиентский таймаут вообще перестаёт иметь
-    # значение, независимо от того, сколько реально займёт обработка.
-    asyncio.create_task(_process_in_background())
-
-    return web.json_response({"ok": True, "status": "processing"})
+    return web.json_response({"ok": True})
 
 
 async def process_new_order(tg_app: Application, order_key: str):
