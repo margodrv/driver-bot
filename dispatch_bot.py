@@ -2846,8 +2846,22 @@ def _format_avto_extra_lines(tj: dict, star) -> list:
         if (dop.get("group") or "avto") != "avto":
             continue
         summa = dop.get("summa")
-        summa_str = f"{_fmt_num(summa)} грн" if summa is not None else "по факту"
         nazvanie = dop.get("nazvanie", "Доп")
+        if summa is not None and "куб" in nazvanie.strip().lower():
+            # Реальный кейс 14.09 (Анастасія): "N кубов ... Тариф BASE
+            # авто+QTY*RATE куб=TOTAL" - GPT сам придумывает название
+            # именной допы (видела "Кубатура по факту") и кладёт туда
+            # СТАВКУ за 1 м³ (RATE), а не разовую доплату. Рендерилось
+            # как "Кубатура по факту: 600 грн" - выглядело как разовая
+            # сумма, хотя это ставка "за куб". Нормализуем название и
+            # добавляем единицу измерения для ЛЮБого варианта названия
+            # от GPT (кубатура/кубометр/куб и т.п.) - саму ставку не
+            # трогаем, только подпись (подтверждено логистом 14.09).
+            summa_str = f"{_fmt_num(summa)} грн/м³"
+            nazvanie = "Кубатура"
+            lines.append(f"{nazvanie}: {summa_str}")
+            continue
+        summa_str = f"{_fmt_num(summa)} грн" if summa is not None else "по факту"
         dop_star = star(["rokla"]) if nazvanie.strip().lower() == "рокла" else ""
         lines.append(f"{nazvanie}: {summa_str}{dop_star}")
 
@@ -2884,8 +2898,15 @@ def _format_gruzchiki_extra_lines(tj: dict, star) -> list:
         if dop.get("group") != "gruzchiki":
             continue
         summa = dop.get("summa")
+        nazvanie = dop.get("nazvanie", "Доп")
+        if summa is not None and "куб" in nazvanie.strip().lower():
+            # См. симметричную нормализацию в _format_avto_extra_lines
+            # (реальный кейс 14.09, Анастасія) - на случай, если GPT
+            # ошибочно положит "кубатуру" в группу грузчиков.
+            lines.append(f"Кубатура: {_fmt_num(summa)} грн/м³")
+            continue
         summa_str = f"{_fmt_num(summa)} грн" if summa is not None else "по факту"
-        lines.append(f"{dop.get('nazvanie', 'Доп')}: {summa_str}")
+        lines.append(f"{nazvanie}: {summa_str}")
 
     return lines
 
