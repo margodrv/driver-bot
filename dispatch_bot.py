@@ -1940,6 +1940,47 @@ def _strip_duplicate_dop_tochka_gidrobort(result: dict, order_text: str):
         tj["dop_tochka"] = None
 
 
+def _reconcile_generic_dopy_named_entry(result: dict):
+    """Реальный кейс (14.09, заказ Анны/Ирины): "Допы по 35" - по
+    подтверждённому правилу (раздел 7) голое слово "допи"/"допы" без
+    уточнения означает СРАЗУ и этажи, и проходы одной и той же суммой -
+    `_RE_DOPY_GENERIC` в `_apply_keyword_overrides` это уже делает
+    (`etazhi_stavka=35`, `prohody_stavka=35`). Но GPT иногда ЗАОДНО
+    ещё и заносит то же самое число в `prochie_dopy` как отдельную
+    именную допу с буквальным названием "Допы"/"Допи" - в превью это
+    задваивалось третьей строкой "Допы: 35 грн" рядом с уже верными
+    "Этажи: 35 грн"/"Проходы: 35 грн", хотя по смыслу это ОДНО и то же
+    число, просто представленное дважды.
+
+    Голое "Допы"/"Допи" (без уточнения типа "Допы с весом" - это другая,
+    самостоятельная именная допа, её не трогаем) как отдельная строка
+    никогда не должна оставаться в превью - по определению это то же
+    самое, что этажи+проходы вместе. Если этажи/проходы к этому моменту
+    ещё не заполнены (реtroспективно - вдруг regex не сработал, а GPT
+    всё-таки распознал текст) - используем найденное здесь значение,
+    чтобы не потерять число молча, а не просто выбрасываем допу."""
+    tj = result.setdefault("tariff_json", {})
+    prochie = tj.get("prochie_dopy") or []
+    if not prochie:
+        return
+    remaining = []
+    changed = False
+    for d in prochie:
+        name = (d.get("nazvanie") or "").strip().lower()
+        if name in ("допы", "допи", "доп", "допа"):
+            val = d.get("summa")
+            if val is not None:
+                if tj.get("etazhi_stavka") is None:
+                    tj["etazhi_stavka"] = val
+                if tj.get("prohody_stavka") is None:
+                    tj["prohody_stavka"] = val
+            changed = True
+            continue  # никогда не оставляем отдельной строкой
+        remaining.append(d)
+    if changed:
+        tj["prochie_dopy"] = remaining
+
+
 def _has_explicit_word_trigger(order_text: str, word_stem: str, value) -> bool:
     """Проверяет, стоит ли слово (например 'точк', 'гідроборт') явно
     рядом с этим конкретным числом в тексте - в любом порядке. Если да -
@@ -2365,6 +2406,29 @@ _RE_BARE_GRUZ_LINE = re.compile(
     r"(\d+(?:[.,]\d+)?)(?:[ \t]*/[ \t]*(\d+(?:[.,]\d+)?))?",
     re.IGNORECASE,
 )
+# Реальный кейс 16.09 (Алексей Конюхов): "Тар БН авто 7500/1400/500
+# экспедитор 350" - роль-число ("экспедитор 350") стоит СРЕДИ строки
+# (сразу после тарифа авто), а не в начале строки/после переноса - ни
+# "Тар"-вариант (`_RE_TAR_GRUZ_NUMBERS`, слово "экспедитор" тут не сразу
+# после "Тар"), ни `_RE_BARE_GRUZ_LINE` (якорь на начало строки) не
+# матчатся. GPT в этом случае положил число отдельной именной допой
+# "Экспедитор: 350 грн" вместо строки "Грузчики:" - хотя по уже
+# подтверждённому правилу (03.09) экспедитор = та же роль, что и
+# грузчики. Тот же приём, что и `_RE_BARE_GRUZ_LINE`, но БЕЗ требования
+# начала строки - безопасно, т.к. по-прежнему требует ЦИФРУ СРАЗУ (не
+# через перенос строки) после слова-роли, поэтому не цепляет голое
+# упоминание роли в шапке без цены рядом.
+_RE_ROLE_NUM_INLINE = re.compile(
+    r"(?:вантажник\w*|груз\w*|(?<![а-яіїєґ])вант(?![а-яіїєґ])|експедитор\w*|экспедитор\w*)[ \t]*:?[ \t]*"
+    r"(\d+(?:[.,]\d+)?)(?:[ \t]*/[ \t]*(\d+(?:[.,]\d+)?))?",
+    re.IGNORECASE,
+)
+# Голое название роли ЦЕЛИКОМ (для дедупа именных доп типа "Экспедитор:
+# 350 грн", когда то же число уже учтено строкой "Грузчики:" - см.
+# _recover_gruzchiki_baza_from_tar_line, реальный кейс 16.09).
+_ROLE_WORD_ONLY_RE = re.compile(
+    r"^(?:вантажник\w*|груз\w*|вант|експедитор\w*|экспедитор\w*)$", re.IGNORECASE
+)
 
 
 def _recover_gruzchiki_baza_from_tar_line(result: dict, order_text: str):
@@ -2412,6 +2476,10 @@ def _recover_gruzchiki_baza_from_tar_line(result: dict, order_text: str):
     bare_fallback = m is None
     if bare_fallback:
         m = _RE_BARE_GRUZ_LINE.search(order_text or "")
+    if bare_fallback and m is None:
+        # Ещё более слабый фолбэк (16.09) - роль-число СРЕДИ строки, без
+        # якоря на начало строки (см. докстринг `_RE_ROLE_NUM_INLINE`).
+        m = _RE_ROLE_NUM_INLINE.search(order_text or "")
     if m and bare_fallback and result.get("gruzchiki_baza") is not None:
         m = None  # слабый сигнал не перезаписывает уже заполненное значение
     if m:
@@ -2434,6 +2502,25 @@ def _recover_gruzchiki_baza_from_tar_line(result: dict, order_text: str):
                     continue
                 kept.append(item)
             result["neponyatno"] = kept
+
+            # Реальный кейс 16.09: GPT ЗАОДНО может положить то же самое
+            # число ещё и именной допой с буквальным названием роли
+            # ("Экспедитор: 350 грн") в prochie_dopy - раз оно теперь
+            # учтено строкой "Грузчики:", убираем дубль-запись, чтобы не
+            # задваивать (тот же класс бага, что и с "Допы", см. раздел
+            # 9 п.18 техсводки).
+            tj_local = result.get("tariff_json") or {}
+            prochie = tj_local.get("prochie_dopy") or []
+            if prochie:
+                remaining = [
+                    d for d in prochie
+                    if not (
+                        _ROLE_WORD_ONLY_RE.fullmatch((d.get("nazvanie") or "").strip())
+                        and _fmt_num(d.get("summa")) in used
+                    )
+                ]
+                if len(remaining) != len(prochie):
+                    tj_local["prochie_dopy"] = remaining
 
     # Часы грузчиков - из той же строки, если явно указаны и GPT их
     # почему-то не проставил (см. дефолт "2ч" в build_tariff_preview,
@@ -2691,6 +2778,7 @@ def parse_tariff_via_gpt(order_text: str) -> dict:
         _strip_implausible_dop_tochka(result, order_text)
         _strip_implausible_gidrobort(result, order_text)
         _strip_implausible_etazhi_prohody(result, order_text)
+        _reconcile_generic_dopy_named_entry(result)
         _normalize_forma_oplaty(result, order_text)
         _route_combined_extra_numbers(result)
         _reconcile_neponyatno(result)
