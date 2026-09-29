@@ -622,8 +622,19 @@ def find_pending_neponyatno_value(tariff: dict, field_key: str):
     return matches[0] if len(matches) == 1 else None
 
 
+# "Експедитор"/"экспедитор" добавлены 03.09 (подтверждено логистом-
+# владельцем: "экспедитор=грузчик" - та же роль, показывается той же
+# строкой "Грузчики:", см. документацию раздел 7). Негативные lookbehind
+# на "без" (слитно и с одним пробелом) добавлены 09.09 (реальный кейс
+# "3Т с ГБ БЕЗ грузчиков" - слово "грузчиков" физически в тексте есть,
+# но с явным отрицанием перед ним означает ровно противоположное; Python
+# `re` требует lookbehind ФИКСИРОВАННОЙ ширины, поэтому два отдельных
+# варианта, не один с `\s*`/`+` внутри).
 _LOADER_TEXT_RE = re.compile(
-    r"(?<![а-яіїєґ])вантаж\w*|(?<![а-яіїєґ])груз\w*|(?<![а-яіїєґ])вант(?![а-яіїєґ])",
+    r"(?<!без)(?<!без[ \t])(?<![а-яіїєґ])вантаж\w*"
+    r"|(?<!без)(?<!без[ \t])(?<![а-яіїєґ])груз\w*"
+    r"|(?<!без)(?<!без[ \t])(?<![а-яіїєґ])вант(?![а-яіїєґ])"
+    r"|(?<![а-яіїєґ])експедитор\w*|(?<![а-яіїєґ])экспедитор\w*",
     re.IGNORECASE,
 )
 
@@ -738,11 +749,22 @@ _RE_GRUZCHIKI_HEADER = re.compile(r"тар[ \t]*\d+[ \t]*вантажник\w*[ 
 _RE_GRUZCHIKI_DOP_CHAS = re.compile(r"(\d+(?:[.,]\d+)?)[ \t]*грн[ \t]*/[ \t]*наступна", re.IGNORECASE)
 _RE_VES = re.compile(r"ваг[іи][ \t]*від[ \t]*(\d+(?:[.,]\d+)?)[ \t]*по[ \t]*(\d+(?:[.,]\d+)?)[ \t]*грн[ \t]*/[ \t]*кг", re.IGNORECASE)
 _RE_VES_DOPY = re.compile(r"прохід[ \t]*\d+[ \t]*м[ \t]*/[ \t]*поверх[ \t]*з[ \t]*вагою[ \t]*по[ \t]*(\d+(?:[.,]\d+)?)[ \t]*грн[ \t]*на[ \t]*людину", re.IGNORECASE)
-_RE_KOM_PERCENT = re.compile(r"ком[ \t]*(\d+(?:[.,]\d+)?)[ \t]*%", re.IGNORECASE)
+_RE_KOM_PERCENT = re.compile(r"(?:ком|кон)[ \t]*(\d+(?:[.,]\d+)?)[ \t]*%", re.IGNORECASE)
 
 
 _RE_ROKLA_GENERAL = re.compile(
     r"(?:рокла[ \t]*(\d+(?:[.,]\d+)?))|(?:(\d+(?:[.,]\d+)?)[ \t]*рокла)", re.IGNORECASE
+)
+# "Nпром точка" слитно (27.08) - симметрично Рокла/ГБ, единственный
+# реально наблюдаемый формат доп.точки без слова "точка" отдельно.
+_RE_DOP_TOCHKA_GENERIC = re.compile(r"(\d+(?:[.,]\d+)?)[ \t]*пром[ \t]*точка", re.IGNORECASE)
+# "доп точка N грн" (03.09, более распространённая формулировка -
+# раздельно, слово "доп" ПЕРЕД "точка") - требует ОБА маркера сразу
+# ("доп" перед "точка" И "грн" сразу после числа), что резко снижает
+# риск повторить ловушку "5500/5000 точка 500грн" (там слова "доп" перед
+# "точка" вообще нет).
+_RE_DOP_TOCHKA_EXPLICIT = re.compile(
+    r"доп[ \t]*точк\w*[ \t]*(\d+(?:[.,]\d+)?)[ \t]*грн", re.IGNORECASE
 )
 _RE_KM_GENERAL = re.compile(r"(\d+(?:[.,]\d+)?)[ \t]*грн[ \t]*/?[ \t]*км", re.IGNORECASE)
 _RE_VES_THRESHOLD_GENERAL = re.compile(
@@ -777,8 +799,16 @@ _RE_HODKA_PRICE = re.compile(
     r"(?:ходк\w*[ \t]*(\d+(?:[.,]\d+)?)[ \t]*грн)|(?:(\d+(?:[.,]\d+)?)[ \t]*грн[ \t]*(?:за[ \t]*)?ходк\w*)",
     re.IGNORECASE,
 )
+# \b (граница слова) не работает между цифрой и буквой (обе "словесные"
+# \w-символы) - "+30допи"/"допи30" (слитно, без пробела) не матчились бы
+# вообще. Заменено на лукбехайнд/лукахед именно на кириллицу с ОБЕИХ
+# сторон слова (26.08, реальные кейсы "+30допи"/"допи30") - не даёт
+# зацепиться за середину других слов ("допомога"/"недопустимо"), но
+# ловит слитные варианты. Единица "грн" между числом и словом (26.08,
+# реальный кейс "30грн допи") поглощается необязательной группой.
 _RE_DOPY_GENERIC = re.compile(
-    r"(?:\bдоп(?:и|ы|ов)?\b[ \t]*(\d+(?:[.,]\d+)?))|(?:(\d+(?:[.,]\d+)?)[ \t]*\bдоп(?:и|ы|ов)?\b)",
+    r"(?:(?<![а-яіїєґ])доп(?:и|ы|ов)?(?![а-яіїєґ])[ \t]*(?:по[ \t]*)?(\d+(?:[.,]\d+)?))"
+    r"|(?:(\d+(?:[.,]\d+)?)[ \t]*(?:грн[ \t]*)?(?<![а-яіїєґ])доп(?:и|ы|ов)?(?![а-яіїєґ]))",
     re.IGNORECASE,
 )
 _RE_PASSENGER_TOTAL_IN_PARENS = re.compile(
@@ -834,6 +864,28 @@ def _apply_keyword_overrides(result: dict, order_text: str):
         prochie = [d for d in (tj.get("prochie_dopy") or []) if (d.get("nazvanie") or "").strip().lower() != "рокла"]
         tj["prochie_dopy"] = prochie
 
+    m = _RE_DOP_TOCHKA_GENERIC.search(order_text or "")
+    if m:
+        # "Nпром точка" (слитно, 27.08) - для доп.точки, в отличие от
+        # Рокла/ГБ, никогда не было своего deterministic-regex'а вообще -
+        # разбор полностью полагался на промпт GPT, а формат "несколько
+        # чисел через '/' с разными подписями подряд" (например "300рокла/
+        # 300пром точка/300гб") GPT не справлялся. Сужено буквально до
+        # "N" + "пром" + "точка" слитно - единственный реально
+        # наблюдаемый формат, никаких голых "число + точка" через пробел
+        # (те уже ловятся отдельно словом "точка" через GPT/ручной ввод,
+        # а голый паттерн легко поймает чужое число не по теме, см.
+        # документацию раздел 9 п.12).
+        val = float(m.group(1).replace(",", "."))
+        tj["dop_tochka"] = {"tip": "doplata_fix", "summa": val}
+        result["_dop_tochka_trusted"] = True
+    else:
+        m = _RE_DOP_TOCHKA_EXPLICIT.search(order_text or "")
+        if m:
+            val = float(m.group(1).replace(",", "."))
+            tj["dop_tochka"] = {"tip": "doplata_fix", "summa": val}
+            result["_dop_tochka_trusted"] = True
+
     m = _RE_KM_GENERAL.search(order_text or "")
     if not m:
         # Реальный кейс (22.08): "заміський км по 65грн" - слово "км"
@@ -855,6 +907,22 @@ def _apply_keyword_overrides(result: dict, order_text: str):
         ot = float(m.group(1).replace(",", "."))
         stavka = float(m.group(2).replace(",", "."))
         tj["ves"] = {"tip": "porogovaya", "porogi": [{"ot": ot, "stavka": stavka}]}
+        result["_ves_trusted"] = True
+    elif _RE_VAGA_PO.search(order_text or ""):
+        # Связка "вага по Nгрн[/кг]" (обобщено 02.09 на общий случай, до
+        # этого использовалась только внутри узкого Виталия-шаблона) -
+        # ставится ПЕРЕД голым _RE_VES_BARE специально. Реальный кейс:
+        # "...вага 240кг. Тар 6000/2500/50 вага по 8грн/кг." - слово
+        # "вага" встречается ДВАЖДЫ, первое описывает вес самого груза
+        # (кг после числа - не ставка), второе - настоящая ставка.
+        # _RE_VES_BARE.search() останавливается на ПЕРВОМ вхождении слова
+        # и, если оно отбраковано проверкой единицы веса, просто сдаётся
+        # - до второго, настоящего вхождения не доходит. Связка "по...грн"
+        # однозначно указывает именно на деньги/ставку, а не на вес
+        # груза, поэтому проверяется отдельно и раньше.
+        m2 = _RE_VAGA_PO.search(order_text or "")
+        stavka = float(m2.group(1).replace(",", "."))
+        tj["ves"] = {"tip": "ploskaya", "stavka": stavka}
         result["_ves_trusted"] = True
     else:
         m = _RE_VES_FORMULA.search(order_text or "")
@@ -1109,7 +1177,9 @@ _RE_COMBINED_TARIFF_MARKER = re.compile(
 )
 _RE_VAGA_PO = re.compile(r"ваг\w*[ \t]*по[ \t]*(\d+(?:[.,]\d+)?)[ \t]*грн", re.IGNORECASE)
 _RE_KM_PO = re.compile(r"км[ \t]*по[ \t]*(\d+(?:[.,]\d+)?)[ \t]*грн", re.IGNORECASE)
-_RE_LOADER_COUNT_PLUS = re.compile(r"(\d+)[ \t]*(?:вантажник\w*|грузчик\w*)", re.IGNORECASE)
+_RE_LOADER_COUNT_PLUS = re.compile(
+    r"(\d+)[ \t]*(?:вантажник\w*|грузчик\w*|експедитор\w*|экспедитор\w*)", re.IGNORECASE
+)
 
 
 def _apply_combined_avto_gruzchiki_template(result: dict, order_text: str):
@@ -1160,7 +1230,9 @@ def _apply_combined_avto_gruzchiki_template(result: dict, order_text: str):
     result["neponyatno"] = []
 
 
-_RE_SEPARATE_LOADERS_LINE = re.compile(r"(?:вантажник\w*|грузчик\w*)[:\s]*\d+(?:[.,]\d+)?", re.IGNORECASE)
+_RE_SEPARATE_LOADERS_LINE = re.compile(
+    r"(?:вантажник\w*|грузчик\w*|експедитор\w*|экспедитор\w*)[:\s]*\d+(?:[.,]\d+)?", re.IGNORECASE
+)
 _RE_TAR_ALL_NUMBERS = re.compile(
     r"тар(?:иф)?[:\s]*(?:\d+(?:[.,]\d+)?[ \t]*ч[а-яё]*[ \t]*)?"
     r"((?:\d+(?:[.,]\d+)?[ \t]*/[ \t]*)+\d+(?:[.,]\d+)?)",
@@ -1292,13 +1364,28 @@ def _route_combined_extra_numbers(result: dict):
 
 
 _RE_LOADER_LUMP_HOURS = re.compile(
-    r"(?:вантажник\w*|грузчик\w*)[:\s]*(\d+(?:[.,]\d+)?)[ \t]*на[ \t]*(\d+(?:[.,]\d+)?)[ \t]*ч[а-яё]*"
+    r"(?:вантажник\w*|грузчик\w*|експедитор\w*|экспедитор\w*)[:\s]*(\d+(?:[.,]\d+)?)[ \t]*на[ \t]*(\d+(?:[.,]\d+)?)[ \t]*ч[а-яё]*"
     r"[ \t]*/[ \t]*(\d+(?:[.,]\d+)?)"
     r"(?:[ \t]*/[ \t]*(\d+(?:[.,]\d+)?)[ \t]*(поверх\w*|эт\w*))?",
     re.IGNORECASE,
 )
+# Ведущая "1" необязательна (27.08, подтверждено логистом-владельцем:
+# "Вантажники 400/час = 1 грузчик 400 грн/час" - голое множественное
+# число тоже ставка за ОДНОГО человека, не общая на бригаду). Единица
+# "грн" между ставкой и "/час" (03.09, реальный кейс "Грузчики
+# 400грн/час" - слово вклинилось между триггером-числом и "/час", не
+# ловилось вообще, база уходила в слабый фолбэк без удвоения).
+# Собрана из нескольких фиксов: ведущая "1" необязательна (27.08); "грн"
+# между ставкой и "/час" (03.09); "експедитор"/"экспедитор" как синоним
+# роли (03.09); необязательное ":?" после слова-роли и "год" наравне с
+# "час" (09.09, реальный кейс "Вантажники: 300грн/год" - ДВА независимых
+# пробела сразу: двоеточие после роли не пропускалось вообще (полного
+# совпадения не было), и литерал "час" не принимал "год" - по отдельности
+# любой из двух давал полный отказ (None), а не частичное совпадение).
 _RE_LOADER_SINGLE_RATE = re.compile(
-    r"\b1[ \t]*(?:вантажник\w*|грузчик\w*)[ \t]*(\d+(?:[.,]\d+)?)[ \t]*/[ \t]*час", re.IGNORECASE
+    r"(?:\b1[ \t]*)?(?:вантажник\w*|грузчик\w*|експедитор\w*|экспедитор\w*)[ \t]*:?[ \t]*"
+    r"(\d+(?:[.,]\d+)?)[ \t]*(?:грн[ \t]*)?/[ \t]*(?:ч[а-яё]*|год\w*)",
+    re.IGNORECASE,
 )
 
 
@@ -1474,7 +1561,10 @@ def _strip_bogus_gruzchiki(result: dict, order_text: str):
     result["neponyatno"] = neponyatno
 
 
-_KOM_TEXT_RE = re.compile(r"\bком\b|коміс\w*", re.IGNORECASE)
+# "Кон" принимается наравне с "Ком" (28.08, реальный кейс "Кон 10%" -
+# опечатка, соседняя с "м" буква на клавиатуре, логист: "% єто всегда
+# ком, видно же что опечатка").
+_KOM_TEXT_RE = re.compile(r"\bком\b|коміс\w*|\bкон\b", re.IGNORECASE)
 
 
 def _kom_stray_numbers(k):
@@ -1607,7 +1697,14 @@ def _strip_bogus_ves(result: dict, order_text: str):
         tj["ves"] = None
 
 
-_RE_KOM_PERCENT_GENERAL = re.compile(r"ком[:\s]*(\d+(?:[.,]\d+)?)[ \t]*%", re.IGNORECASE)
+_RE_KOM_PERCENT_GENERAL = re.compile(r"(?:ком|кон)[:\s]*(\d+(?:[.,]\d+)?)[ \t]*%", re.IGNORECASE)
+# Формат неponyatno от самого GPT ("10%: комісія?") - число с "%"
+# внутри, не проходит _NEPONYATNO_ITEM_RE (та ожидает "N: ..." без "%").
+_NEPONYATNO_PERCENT_ITEM_RE = re.compile(r"^\s*([\d.,]+)%\s*:\s*(.+)$")
+# Последний рубеж (28.08): в этой системе "%" не означает НИЧЕГО, кроме
+# комиссии - если ни "ком", ни "кон" не нашлись, а комиссия по-прежнему
+# пуста, достаём любое "N%" из текста как есть.
+_RE_BARE_PERCENT = re.compile(r"(\d+(?:[.,]\d+)?)[ \t]*%", re.IGNORECASE)
 
 
 def _fix_kom_duplicating_dop_chas(result: dict, order_text: str):
@@ -1633,10 +1730,18 @@ def _recover_kom_percent_if_missing(result: dict, order_text: str):
     пустая, а в тексте есть явный "Ком X%" - берём напрямую регэкспом,
     гарантированно, не полагаясь на то, что GPT в этот раз распознает
     свою же собственную явную комиссию. Заодно убираем дублирующее
-    предупреждение по этому же числу, если оно там осело."""
+    предупреждение по этому же числу, если оно там осело.
+
+    Последний рубеж (28.08): если ни "Ком"/"Кон" X% не нашлось, а
+    комиссия всё равно пуста - достаём ЛЮБОЕ "N%" из текста как есть
+    (_RE_BARE_PERCENT) - в этой системе "%" не означает ничего, кроме
+    комиссии. Чистка предупреждений теперь ловит и GPT-шный
+    нестандартный формат "N%: ..." (было только наше "N: ...")."""
     if result.get("kom_avto") or result.get("kom_gruzchiki"):
         return
     m = _RE_KOM_PERCENT_GENERAL.search(order_text or "")
+    if not m:
+        m = _RE_BARE_PERCENT.search(order_text or "")
     if not m:
         return
     val = float(m.group(1).replace(",", "."))
@@ -1646,6 +1751,9 @@ def _recover_kom_percent_if_missing(result: dict, order_text: str):
     for item in result.get("neponyatno") or []:
         m2 = _NEPONYATNO_ITEM_RE.match(item)
         if m2 and m2.group(1) == val_str:
+            continue
+        m3 = _NEPONYATNO_PERCENT_ITEM_RE.match(item)
+        if m3 and m3.group(1) == val_str:
             continue
         kept.append(item)
     result["neponyatno"] = kept
@@ -1693,8 +1801,12 @@ def _strip_bogus_dop_tochka_without_word(result: dict, order_text: str):
     позиции числа в шаблоне, а не по слову "точка" рядом) не трогаем -
     эта защита создавалась для другого случая (GPT сам придумывает
     доп.точку без всякого основания) и не должна портить шаблон, где
-    основание есть, просто не текстовое."""
-    if result.pop("_dop_tochka_trusted", False):
+    основание есть, просто не текстовое.
+
+    С 27.08 у флага ДВА источника (см. документацию, раздел 5) - читаем
+    через get(), НЕ снимаем: более поздняя защита
+    (_strip_duplicate_dop_tochka_gidrobort) тоже должна его увидеть."""
+    if result.get("_dop_tochka_trusted", False):
         return
     tj = result.setdefault("tariff_json", {})
     dt = tj.get("dop_tochka")
@@ -1733,15 +1845,45 @@ def _strip_duplicate_dop_tochka_km(result: dict, order_text: str):
         tj["dop_tochka"] = None
 
 
+def _strip_duplicate_dop_tochka_gidrobort(result: dict, order_text: str):
+    """Зеркало _strip_duplicate_dop_tochka_km (27.08, реальный кейс
+    'Виталия'-заказ БН, 'Тар БН 2ч 1800/600/300гб'): ГБ разобрался верно
+    (слово 'гб' рядом с числом), но GPT ЗАОДНО насочинял ту же сумму 300
+    ещё и в Доп.точку - хотя слова 'точк' в тексте нет ВООБЩЕ ни в каком
+    виде. Если Доп.точка совпадает по сумме с Гідробортом и рядом нет
+    слова 'точк' - это дубль-фантом, убираем Доп.точку.
+
+    НЕ трогает значения с флагом '_dop_tochka_trusted' (см. документацию,
+    раздел 5) - доверенный текстовый источник (например 'Nпром точка')
+    может СЛУЧАЙНО совпасть по сумме с ГБ, это два легитимно разных
+    платежа (круглые суммы типа 300/500 в тарифах повторяются часто), не
+    дубль. Последний потребитель флага в цепочке - снимает его (pop).
+    """
+    trusted = result.pop("_dop_tochka_trusted", False)
+    tj = result.setdefault("tariff_json", {})
+    dt = tj.get("dop_tochka")
+    gb = tj.get("gidrobort")
+    if not dt or not gb or trusted:
+        return
+    if dt.get("summa") == gb.get("summa") and "точк" not in (order_text or "").lower():
+        tj["dop_tochka"] = None
+
+
 def _has_explicit_word_trigger(order_text: str, word_stem: str, value) -> bool:
     """Проверяет, стоит ли слово (например 'точк', 'гідроборт') явно
     рядом с этим конкретным числом в тексте - в любом порядке. Если да -
     это НЕ неоднозначный случай, а явное указание автора заявки, и
     диапазон правдоподобия проверять не нужно - человек написал прямым
     текстом, чему верить."""
+    # Граница ПОСЛЕ числа - (?!\d), а не \b (27.08, реальный кейс "точка
+    # 500грн" слитно): \b не работает между цифрой и буквой (оба "\w"),
+    # поэтому "500" не находило соседства со словом "точка", хотя оно
+    # там прямо рядом. (?!\d) пропускает слитную единицу измерения после
+    # числа и заодно не даёт зацепиться за середину большего числа
+    # ("500" внутри "5000").
     val_str = re.escape(_fmt_num(value))
     pattern = re.compile(
-        rf"{word_stem}\w*[ \t]*{val_str}\b|{val_str}[ \t]*{word_stem}\w*", re.IGNORECASE
+        rf"{word_stem}\w*[ \t]*{val_str}(?!\d)|{val_str}(?!\d)[ \t]*{word_stem}\w*", re.IGNORECASE
     )
     return bool(pattern.search(order_text or ""))
 
@@ -1839,6 +1981,50 @@ def _strip_implausible_etazhi_prohody(result: dict, order_text: str = ""):
         if explicit:
             continue
         tj[key] = None
+
+
+_BARE_DOPY_NAME_RE = re.compile(r"^(?:допи|допы|доп|допа)$", re.IGNORECASE)
+
+
+def _reconcile_generic_dopy_named_entry(result: dict):
+    """Реальный кейс (14.09, вывоз мебели): "...Допи по 35\nВес по 10\n
+    Ком 25%..." - голое слово "допи" без уточнения (правило раздела 7)
+    уже корректно разложено _RE_DOPY_GENERIC в etazhi_stavka=35/
+    prohody_stavka=35 ("Этажи: 35 грн"/"Проходы: 35 грн" - верно). Но
+    GPT, разбирая тот же текст, ПАРАЛЛЕЛЬНО ЕЩЁ РАЗ кладёт то же самое
+    число именной допой с буквальным названием "Допы"/"Допи" в
+    prochie_dopy (свободный список для разовых доплат без спец.поля,
+    задуманный для Рокла/Санобробки/"кубатуры" и т.п.) - рендер именных
+    доп не знает, что это число уже полностью учтено в двух других
+    полях, получается задвоение одного смысла тремя строками.
+
+    Находит в prochie_dopy запись, чьё название (без учёта регистра/
+    пробелов) буквально равно "допи"/"допы"/"доп"/"допа" (голое слово
+    БЕЗ уточнения - "Допы з вагою" и подобные уточнённые названия НЕ
+    трогает, это отдельные самостоятельные допы), и БЕЗУСЛОВНО убирает
+    такую запись, чтобы она не рендерилась отдельной строкой.
+
+    Защитно: если на этот момент etazhi_stavka/prohody_stavka ЕЩЁ
+    пустые (регэксп почему-то не сработал, а GPT это число всё же
+    распознал) - используем значение из убираемой записи, чтобы
+    заполнить их, а не терять число молча."""
+    tj = result.setdefault("tariff_json", {})
+    dopy = tj.get("prochie_dopy")
+    if not isinstance(dopy, list) or not dopy:
+        return
+    kept = []
+    for dop in dopy:
+        nazvanie = (dop.get("nazvanie") or "").strip()
+        if _BARE_DOPY_NAME_RE.fullmatch(nazvanie):
+            summa = dop.get("summa")
+            if summa is not None:
+                if tj.get("etazhi_stavka") is None:
+                    tj["etazhi_stavka"] = summa
+                if tj.get("prohody_stavka") is None:
+                    tj["prohody_stavka"] = summa
+            continue  # убираем - не рендерим отдельной строкой
+        kept.append(dop)
+    tj["prochie_dopy"] = kept
 
 
 _FORMA_NAL_RE = re.compile(r"\bнал\w*|готів\w*", re.IGNORECASE)
@@ -1967,15 +2153,43 @@ def _split_gruzchiki_dopy_by_plausibility(result: dict):
     Порог сдвинут с ≤15 на ≤14 (22.08, подтверждено логистом-владельцем) -
     "15" само по себе теперь считается слишком большим для веса, уходит
     в этажи/проходы.
+
+    Фикс 03.09 (реальный кейс "+400/год +20 доп. вантажники"): число
+    "20" уже верно классифицировано ЯВНЫМ текстовым триггером ("20 доп."
+    → _RE_DOPY_GENERIC, этажи+проходы) РАНЬШЕ по цепочке, и
+    _reconcile_neponyatno уже убрал дублирующее "не понял" по этому
+    числу - но GPT НЕЗАВИСИМО положил то же "20" ещё и в gruzchiki_dopy
+    (лишнее число рядом с грузчиками), и эта функция, не зная, что оно
+    уже классифицировано, "воскрешала" только что убранное
+    предупреждение (ветка "этажи/проходы уже назначены другим числом").
+    Строим набор уже классифицированных значений (тот же набор полей,
+    что и в _reconcile_neponyatno) и молча пропускаем такие числа - не в
+    remaining, не в neponyatno, просто игнорируем повторное упоминание.
     """
     dopy = result.get("gruzchiki_dopy") or []
     if not dopy:
         return
     tj = result.setdefault("tariff_json", {})
+
+    used_numbers = set()
+    for key in ("dop_tochka", "gidrobort"):
+        d = tj.get(key)
+        if d and d.get("summa") is not None:
+            used_numbers.add(_fmt_num(d["summa"]))
+    for key in ("km_stavka", "etazhi_stavka", "prohody_stavka"):
+        v = tj.get(key)
+        if v is not None:
+            used_numbers.add(_fmt_num(v))
+    for dop in tj.get("prochie_dopy") or []:
+        if dop.get("summa") is not None:
+            used_numbers.add(_fmt_num(dop["summa"]))
+
     remaining = []
     neponyatno = list(result.get("neponyatno") or [])
     etazh_prohod_assigned = tj.get("etazhi_stavka") is not None or tj.get("prohody_stavka") is not None
     for val in dopy:
+        if _fmt_num(val) in used_numbers:
+            continue  # уже классифицировано в другом поле - не трогаем повторно
         if val <= 14 and not tj.get("ves"):
             tj["ves"] = {"tip": "ploskaya", "stavka": val}
         elif val <= 14:
@@ -1999,15 +2213,20 @@ def _split_gruzchiki_dopy_by_plausibility(result: dict):
 # как единый блок: если после найденного числа не идёт ни "ч...", ни
 # "годин...", вся группа целиком считается отсутствующей - число НЕ
 # "откусывается" от настоящей базы (см. раздел 9 п.7/9 документации).
-_RE_TAR_HOURS_SKIP = r"(?:\d+(?:[.,]\d+)?[ \t]*(?:ч[а-яё]*|годин\w*)[ \t]*:?[ \t]*)?"
+_RE_TAR_HOURS_SKIP = r"(?:\d+(?:[.,]\d+)?[ \t]*(?:ч[а-яё]*|год\w*)[ \t]*:?[ \t]*)?"
 
 _RE_TAR_NUMBERS = re.compile(
     r"тар(?:иф)?[:\s]*" + _RE_TAR_HOURS_SKIP +
     r"(\d+(?:[.,]\d+)?)(?=[ \t]*(?:/|грн|\s|$))(?:[ \t]*/[ \t]*(\d+(?:[.,]\d+)?))?",
     re.IGNORECASE,
 )
+# Необязательный ":?" после "авто" (03.09, реальный кейс "Авто: 6000/1650"
+# - двоеточие раньше не пропускалось, регэксп не матчился НИ ОДНИМ из
+# вариантов, и строка "Авто:" пропадала из превью ПОЛНОСТЬЮ). В пределах
+# строки, без переноса - не хотим "перепрыгивать" на постороннее число
+# дальше по тексту.
 _RE_TAR_AVTO_NUMBERS = re.compile(
-    r"тар(?:иф)?[:\s]*\n?[ \t]*авто[ \t]*" + _RE_TAR_HOURS_SKIP +
+    r"тар(?:иф)?[:\s]*\n?[ \t]*авто[ \t]*:?[ \t]*" + _RE_TAR_HOURS_SKIP +
     r"(\d+(?:[.,]\d+)?)(?:[ \t]*/[ \t]*(\d+(?:[.,]\d+)?))?",
     re.IGNORECASE,
 )
@@ -2061,7 +2280,154 @@ def _recover_avto_baza_from_tar_line(result: dict, order_text: str):
         pass
 
 
-def _normalize_neponyatno_candidates(result: dict):
+# Симметричный аналог _RE_TAR_AVTO_NUMBERS/_RE_TAR_HOURS_SKIP, но опорное
+# слово - роль грузчиков (вантажник/груз/вант/експедитор/экспедитор), а
+# не "авто" (фикс 26.08, реальный кейс - отдельная строка "Тар грузч
+# Nч X/Y" терялась целиком, если GPT её не подхватывал). "експедитор"/
+# "экспедитор" добавлены 03.09 (роль подтверждена той же, что и
+# грузчики - см. документацию, раздел 7).
+_RE_TAR_GRUZ_NUMBERS = re.compile(
+    r"тар(?:иф)?[:\s]*\n?[ \t]*(?:вантажник\w*|груз\w*|вант|експедитор\w*|экспедитор\w*)[ \t]*:?[ \t]*"
+    + _RE_TAR_HOURS_SKIP +
+    r"(\d+(?:[.,]\d+)?)(?:[ \t]*/[ \t]*(\d+(?:[.,]\d+)?))?",
+    re.IGNORECASE,
+)
+# Часы грузчиков подхватываются ОТДЕЛЬНЫМ регэкспом (не через общую
+# группу внутри _RE_TAR_HOURS_SKIP - та переиспользуется в
+# _RE_TAR_NUMBERS/_RE_TAR_AVTO_NUMBERS, менять номера групп в ней
+# означало бы сломать оба этих регэкспа).
+_RE_TAR_GRUZ_HOURS = re.compile(
+    r"тар(?:иф)?[:\s]*\n?[ \t]*(?:вантажник\w*|груз\w*|вант|експедитор\w*|экспедитор\w*)[ \t]*:?[ \t]*"
+    r"(\d+(?:[.,]\d+)?)[ \t]*(?:ч[а-яё]*|год\w*)",
+    re.IGNORECASE,
+)
+# Более слабый фолбэк (28.08, реальный кейс "Вантажник:800/400" без
+# слова "Тар" перед собой) - привязан к НАЧАЛУ СТРОКИ вместо "Тар", чтобы
+# не поймать слово-роль в шапке заказа (например "Авто:3Т+ вантажник",
+# где оно не в начале строки). Более слабый сигнал, чем "Тар"-вариант -
+# НИКОГДА не перезаписывает уже классифицированное значение, только
+# заполняет пустое (см. _recover_gruzchiki_baza_from_tar_line ниже).
+_RE_BARE_GRUZ_LINE = re.compile(
+    r"(?:^|\n)[ \t]*(?:вантажник\w*|груз\w*|вант|експедитор\w*|экспедитор\w*)[ \t]*:?[ \t]*"
+    r"(\d+(?:[.,]\d+)?)(?:[ \t]*/[ \t]*(\d+(?:[.,]\d+)?))?",
+    re.IGNORECASE,
+)
+# Ещё более слабый фолбэк (15.09, реальный кейс "...500 экспедитор 350"
+# - роль-число СРЕДИ строки, сразу после ДРУГОГО тарифа, без переноса
+# строки перед собой) - без требования начала строки И без требования
+# "Тар" рядом. Используется ТОЛЬКО если оба более сильных варианта не
+# сработали - по-прежнему требует ЦИФРУ СРАЗУ (без переноса строки)
+# после слова-роли, так что голое упоминание роли в шапке без цены рядом
+# не матчится (после слова до конца строки только пробелы, не цифра).
+_RE_ROLE_NUM_INLINE = re.compile(
+    r"(?:вантажник\w*|груз\w*|(?<![а-яіїєґ])вант(?![а-яіїєґ])|експедитор\w*|экспедитор\w*)[ \t]*:?[ \t]*"
+    r"(\d+(?:[.,]\d+)?)(?:[ \t]*/[ \t]*(\d+(?:[.,]\d+)?))?",
+    re.IGNORECASE,
+)
+# Проверка "название именной допы - это ГОЛОЕ слово-роль без уточнения"
+# (используется для дедупа, см. ниже) - "Экспедитор"/"Вантажник"/"Груз"
+# да, "Экспедитор доп.точка" - нет (уточнённое название, не трогаем).
+_ROLE_WORD_ONLY_RE = re.compile(
+    r"^(?:вантажник\w*|груз\w*|вант|експедитор\w*|экспедитор\w*)$", re.IGNORECASE
+)
+
+
+def _recover_gruzchiki_baza_from_tar_line(result: dict, order_text: str):
+    """Симметричный аналог _recover_avto_baza_from_tar_line (26.08) - у
+    авто уже была финальная авторитетная проверка по строке "Тар...", у
+    грузчиков её не было вообще. Реальный кейс: отдельная строка "Тар
+    грузч 3ч 2400/800" терялась ПОЛНОСТЬЮ (ни цифр, ни даже "не понял"),
+    если GPT её не подхватывал - сокращение "грузч" в связке именно со
+    словом "Тар" сбивало GPT.
+
+    Три уровня фолбэка, от сильного к слабому (см. регэкспы выше):
+      1. "Тар грузч/вантажник/... [Nч] X[/Y]" - САМЫЙ авторитетный,
+         поведение как у авто: ПЕРЕЗАПИСЫВАЕТ уже разобранное значение,
+         если оно не совпадает (число после "Тар" всегда оказывалось
+         настоящим).
+      2. "Вантажник:X[/Y]" в начале строки, без "Тар" (28.08) - слабее,
+         только заполняет пустое значение, не перезаписывает.
+      3. "...роль X[/Y]" СРЕДИ строки, без начала строки и без "Тар"
+         (15.09) - самый слабый, тоже только заполняет пустое.
+
+    Заодно (15.09): если сработал любой из трёх регэкспов, а GPT УЖЕ
+    положил то же число именной допой с ГОЛЫМ названием роли (без
+    уточнения, например "Экспедитор"/"Вантажник") в prochie_dopy - эта
+    запись убирается, чтобы не задвоить (тот же класс бага, что и с
+    "Допы", 14.09) - уточнённые названия ("Экспедитор доп.точка" и
+    т.п.) не трогаются.
+    """
+    text = order_text or ""
+
+    def _dedupe_role_named_dop(summa: float):
+        tj = result.get("tariff_json")
+        if not isinstance(tj, dict):
+            return
+        dopy = tj.get("prochie_dopy")
+        if not isinstance(dopy, list):
+            return
+        kept = []
+        for dop in dopy:
+            nazvanie = (dop.get("nazvanie") or "").strip()
+            dop_summa = dop.get("summa")
+            if (
+                _ROLE_WORD_ONLY_RE.fullmatch(nazvanie)
+                and dop_summa is not None
+                and float(dop_summa) == summa
+            ):
+                continue  # дубликат, вычищаем
+            kept.append(dop)
+        tj["prochie_dopy"] = kept
+
+    m = _RE_TAR_GRUZ_NUMBERS.search(text)
+    if m:
+        tar_baza = float(m.group(1).replace(",", "."))
+        if result.get("gruzchiki_baza") != tar_baza:
+            result["gruzchiki_baza"] = tar_baza
+            if m.group(2):
+                result["gruzchiki_dop_chas"] = float(m.group(2).replace(",", "."))
+            hm = _RE_TAR_GRUZ_HOURS.search(text)
+            if hm:
+                result["gruzchiki_chasov"] = float(hm.group(1).replace(",", "."))
+            _dedupe_role_named_dop(tar_baza)
+        return
+
+    if result.get("gruzchiki_baza") is not None:
+        return  # уже есть значение - более слабые фолбэки его не трогают
+
+    m = _RE_BARE_GRUZ_LINE.search(text)
+    if m:
+        baza = float(m.group(1).replace(",", "."))
+        result["gruzchiki_baza"] = baza
+        if m.group(2):
+            result["gruzchiki_dop_chas"] = float(m.group(2).replace(",", "."))
+        _dedupe_role_named_dop(baza)
+        return
+
+    m = _RE_ROLE_NUM_INLINE.search(text)
+    if m:
+        baza = float(m.group(1).replace(",", "."))
+        result["gruzchiki_baza"] = baza
+        if m.group(2):
+            result["gruzchiki_dop_chas"] = float(m.group(2).replace(",", "."))
+        _dedupe_role_named_dop(baza)
+
+
+# "ГБ?" не предлагается кандидатом, если рядом со словом "гб"/"гідроборт"
+# нет вообще никакой цифры (28.08, уточнение правила 27.08). Для ГБ (как
+# и для Рокла) действует бизнес-правило "упомянут без цены = включён
+# бесплатно, вопрос закрыт" (раздел 7 документации) - значит голое
+# упоминание слова "гб" НЕ означает "вопрос открыт", оно означает ровно
+# обратное. Требуем ХОТЬ КАКУЮ-ТО цифру рядом со словом (не обязательно
+# именно то число, что сейчас проверяется - просто доказательство, что
+# вопрос про ГБ вообще ещё не закрыт).
+_GIDROBORT_PRICED_RE = re.compile(
+    r"(?:гб|гідроборт\w*)[ \t]*:?[ \t]*\d|\d[ \t]*(?:грн[ \t]*)?(?:гб|гідроборт\w*)",
+    re.IGNORECASE,
+)
+
+
+def _normalize_neponyatno_candidates(result: dict, order_text: str = ""):
     """Реальный кейс: GPT сам предложил '40: ГБ?/точка?' - но 40 не
     подходит НИ под ГБ (200-800), НИ под доп.точку (150+, кратно 50) по
     цене вообще, а "км?" (у которого нет жёсткого нижнего порога) вообще
@@ -2070,9 +2436,12 @@ def _normalize_neponyatno_candidates(result: dict):
     последовал собственному правилу диапазонов при выборе, что предложить.
 
     Финальная чистка независимо от источника: убираем "ГБ?"/"точка?" из
-    кандидатов, если число не подходит им по диапазону, и ВСЕГДА
-    добавляем "км?", если его ещё нет - у км нет жёсткого нижнего
-    порога, он универсальный запасной вариант."""
+    кандидатов, если число не подходит им по диапазону (или если для ГБ
+    в тексте вообще нет слова "гб"/"гідроборт" РЯДОМ С ЦИФРОЙ, см.
+    _GIDROBORT_PRICED_RE выше), и ВСЕГДА добавляем "км?", если его ещё
+    нет - у км нет жёсткого нижнего порога, он универсальный запасной
+    вариант."""
+    gb_priced = bool(_GIDROBORT_PRICED_RE.search(order_text or ""))
     kept = []
     for item in result.get("neponyatno") or []:
         m = _NEPONYATNO_ITEM_RE.match(item)
@@ -2090,7 +2459,7 @@ def _normalize_neponyatno_candidates(result: dict):
         new_cands = []
         for c in cands:
             low = c.lower().rstrip("?")
-            if low == "гб" and not _is_plausible_gidrobort(val):
+            if low == "гб" and not (gb_priced and _is_plausible_gidrobort(val)):
                 continue
             if low == "точка" and (val < 150 or val % 50 != 0):
                 continue
@@ -2133,6 +2502,20 @@ def _dedupe_neponyatno_by_number(result: dict):
     ]
 
 
+# Словесное перечисление нескольких адресов/объектов в рамках маршрута
+# (27.08, реальный кейс "Т2~3-5 шкіл на Печерську") - число(-диапазон),
+# за которым сразу следует подсчёт объектов доставки.
+_RE_MULTI_ADDRESS_WORDS = re.compile(
+    r"\d+(?:[ \t]*-[ \t]*\d+)?[ \t]*(?:шк[іi]л\w*|школ\w*|адрес\w*|об'?єкт\w*)",
+    re.IGNORECASE,
+)
+# Точка маршрута обозначена знаком "?" вместо адреса (16.09, подтверждено
+# логистом-владельцем: "если около Т2 знак ? - значит будет несколько
+# точек") - буква "т", необязательная цифра, затем "?" (ловит "Т?"/
+# "Т2?"/"Т2 - Т?").
+_RE_ROUTE_UNKNOWN_STOP = re.compile(r"(?<![а-яіїєґ])т\d*[ \t]*\?", re.IGNORECASE)
+
+
 def _apply_hodka_context_to_dop_tochka(result: dict, order_text: str):
     """Подтверждено: слово 'ходка'/'ходки' в тексте (даже не рядом с
     самим числом - например "(три ходки)" в описании точки маршрута,
@@ -2147,13 +2530,28 @@ def _apply_hodka_context_to_dop_tochka(result: dict, order_text: str):
     (4 точки маршрута) + "Тар 2600/700/500" - GPT оставил 500 в 'не
     понял', хотя маршрут явно многоточечный.
 
+    Третий сигнал (27.08): маршрут, где несколько адресов перечислены
+    СЛОВАМИ, а не Т3/Т4 - "N(-M) шкіл/школ/адрес/об'єктів" (реальный
+    кейс "Т2~3-5 шкіл на Печерську" - несколько школ в рамках одной точки
+    Т2, фактически несколько адресов доставки).
+
+    Четвёртый сигнал (16.09, подтверждено логистом-владельцем явным
+    правилом "если около Т2 знак ? - значит будет несколько точек"):
+    точка маршрута обозначена знаком "?" вместо адреса ("Т2 - Т?") - тот
+    же смысл, что и Т3/Т4+ и словесное перечисление - прямое текстовое
+    доказательство многоточечности маршрута.
+
     Если доп.точка уже определена - не трогаем. Ищем среди 'не понял'
     первое число, подходящее по диапазону (150-700+, кратно 50), и
     переводим его в доп.точку.
     """
     text_low = (order_text or "").lower()
     has_hodka_context = "ходк" in text_low and not _RE_HODKA_PRICE.search(order_text or "")
-    has_extra_stops = bool(re.search(r"\bт[3-9]\b", text_low, re.IGNORECASE))
+    has_extra_stops = (
+        bool(re.search(r"\bт[3-9]\b", text_low, re.IGNORECASE))
+        or bool(_RE_MULTI_ADDRESS_WORDS.search(text_low))
+        or bool(_RE_ROUTE_UNKNOWN_STOP.search(text_low))
+    )
     if not (has_hodka_context or has_extra_stops):
         return
     tj = result.setdefault("tariff_json", {})
@@ -2262,16 +2660,19 @@ def parse_tariff_via_gpt(order_text: str) -> dict:
         _strip_bogus_gidrobort(result)
         _strip_bogus_dop_tochka_without_word(result, order_text)
         _strip_duplicate_dop_tochka_km(result, order_text)
+        _strip_duplicate_dop_tochka_gidrobort(result, order_text)
         _strip_implausible_dop_tochka(result, order_text)
         _strip_implausible_gidrobort(result, order_text)
         _strip_implausible_etazhi_prohody(result, order_text)
+        _reconcile_generic_dopy_named_entry(result)
         _normalize_forma_oplaty(result, order_text)
         _route_combined_extra_numbers(result)
         _reconcile_neponyatno(result)
         _apply_hodka_context_to_dop_tochka(result, order_text)
         _split_gruzchiki_dopy_by_plausibility(result)
         _recover_avto_baza_from_tar_line(result, order_text)
-        _normalize_neponyatno_candidates(result)
+        _recover_gruzchiki_baza_from_tar_line(result, order_text)
+        _normalize_neponyatno_candidates(result, order_text)
         _dedupe_neponyatno_by_number(result)
         return result
     except Exception as e:
@@ -2292,9 +2693,14 @@ def _fmt_num(n) -> str:
 
 
 def build_tariff_preview(tariff: dict, author_line: str = "", edited_fields: set = frozenset()) -> str:
+    """author_line больше НЕ добавляется первой строкой превью (фикс
+    02.09) - подтверждено логистом-владельцем: тег "@username логиста"
+    из футера заявки (контакт-подпись контрагента, не адресация боту)
+    не нужен в превью, "так не нужно - в другой группе такого нет".
+    Параметр и инфраструктура extract_order_author/_order_author_line
+    оставлены нетронутыми (возможно понадобятся для чего-то ещё в
+    будущем) - убрано только само появление строки в тексте превью."""
     lines = []
-    if author_line:
-        lines.append(author_line)
     lines.append("📋 Тариф по заказу")
 
     star = lambda keys: " ⭐️" if edited_fields & set(keys) else ""
@@ -2381,6 +2787,15 @@ def build_tariff_preview(tariff: dict, author_line: str = "", edited_fields: set
     return "\n".join(lines)
 
 
+def _is_kubatura_name(nazvanie: str) -> bool:
+    """Реальный кейс (14.09, вывоз мусора): '600 грн/м³' пришло как
+    именная допа с названием, которое GPT формулирует по-разному
+    ('кубатура'/'кубатура по факту'/'кубометр'/голое 'куб' и т.п.) -
+    подстрока 'куб' в любом регистре/формулировке. Специально не привязано
+    к конкретному тексту ('Кубатура по факту') - лечит класс проблемы."""
+    return "куб" in (nazvanie or "").strip().lower()
+
+
 def _format_avto_extra_lines(tj: dict, star) -> list:
     """Доп.начисления, которые ВСЕГДА относятся к авто (не к грузчикам):
     гідроборт, доп.ходка, км, плюс именные допы с group='avto'."""
@@ -2407,8 +2822,16 @@ def _format_avto_extra_lines(tj: dict, star) -> list:
         if (dop.get("group") or "avto") != "avto":
             continue
         summa = dop.get("summa")
-        summa_str = f"{_fmt_num(summa)} грн" if summa is not None else "по факту"
         nazvanie = dop.get("nazvanie", "Доп")
+        if _is_kubatura_name(nazvanie):
+            # "Кубатура (по факту)"/"кубометр"/голое "куб" и т.п. (14.09) -
+            # это СТАВКА за 1 м³ (итоговое количество кубов известно
+            # только на месте), не разовая доплата - подпись должна
+            # явно показывать "за м³", а не буквальное имя от GPT.
+            summa_str = f"{_fmt_num(summa)} грн" if summa is not None else "по факту"
+            lines.append(f"Кубатура: {summa_str}/м³")
+            continue
+        summa_str = f"{_fmt_num(summa)} грн" if summa is not None else "по факту"
         dop_star = star(["rokla"]) if nazvanie.strip().lower() == "рокла" else ""
         lines.append(f"{nazvanie}: {summa_str}{dop_star}")
 
@@ -2445,8 +2868,13 @@ def _format_gruzchiki_extra_lines(tj: dict, star) -> list:
         if dop.get("group") != "gruzchiki":
             continue
         summa = dop.get("summa")
+        nazvanie = dop.get("nazvanie", "Доп")
+        if _is_kubatura_name(nazvanie):
+            summa_str = f"{_fmt_num(summa)} грн" if summa is not None else "по факту"
+            lines.append(f"Кубатура: {summa_str}/м³")
+            continue
         summa_str = f"{_fmt_num(summa)} грн" if summa is not None else "по факту"
-        lines.append(f"{dop.get('nazvanie', 'Доп')}: {summa_str}")
+        lines.append(f"{nazvanie}: {summa_str}")
 
     return lines
 
