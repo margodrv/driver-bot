@@ -768,8 +768,18 @@ _RE_DOP_TOCHKA_EXPLICIT = re.compile(
 )
 _RE_KM_GENERAL = re.compile(r"(\d+(?:[.,]\d+)?)[ \t]*грн[ \t]*/?[ \t]*км", re.IGNORECASE)
 _RE_VES_THRESHOLD_GENERAL = re.compile(
-    r"ваг\w*[ \t]*від[ \t]*(\d+(?:[.,]\d+)?)[ \t]*по[ \t]*(\d+(?:[.,]\d+)?)[ \t]*грн[ \t]*/[ \t]*кг", re.IGNORECASE
+    r"ваг\w*[^\n]{0,40}?від[ \t]*(\d+(?:[.,]\d+)?)[^\n]{0,20}?по[ \t]*(\d+(?:[.,]\d+)?)"
+    r"[ \t]*грн[ \t]*/[ \t]*(?:\d+[ \t]*)?кг",
+    re.IGNORECASE,
 )
+# Реальный кейс (29.09): "вага якщо буде від 80кг то по 8грн/1кг" -
+# раньше требовалось "ваг...від" и "N по" ВПРИТЫК (только пробелы), а
+# здесь между ними слова ("якщо буде", "кг то") - не матчилось вообще.
+# Заодно денежная часть "8грн/1кг" (с цифрой "1" перед "кг" - "за 1 кг")
+# тоже не матчилась - старый паттерн ожидал "грн/кг" без цифры между "/"
+# и "кг". Оба пробела закрыты одним и тем же паттерном выше - тот же
+# класс бага, что уже не раз ловили (раздел 9 проекта): регэксп ожидал
+# триггер ВПРИТЫК к числу, а в реальном тексте между ними слова/единицы.
 _RE_VES_FORMULA = re.compile(
     r"кг[^\n]*?\*[ \t]*(\d+(?:[.,]\d+)?)[ \t]*грн", re.IGNORECASE
 )
@@ -1705,6 +1715,16 @@ _NEPONYATNO_PERCENT_ITEM_RE = re.compile(r"^\s*([\d.,]+)%\s*:\s*(.+)$")
 # комиссии - если ни "ком", ни "кон" не нашлись, а комиссия по-прежнему
 # пуста, достаём любое "N%" из текста как есть.
 _RE_BARE_PERCENT = re.compile(r"(\d+(?:[.,]\d+)?)[ \t]*%", re.IGNORECASE)
+# Реальный кейс (29.09): "...послуги, які не прописані в тарифі то ціну
+# узгоджуйте на місці на них комісія 20%" - отдельная, третья комиссия
+# (не kom_avto, не kom_gruzchiki) специально на доп.услуги, которые ещё
+# не известны и будут согласованы на месте. Подтверждено логистом-
+# владельцем явно: "это ком по этому заказу на услуги которые не
+# перечислены но могут возникнуть" - полноценная информация, не шум.
+_RE_DOP_USLUGI_KOM = re.compile(
+    r"послуг\w*[^\n]*?(?:ком|кон|коміс\w*)[ \t]*(\d+(?:[.,]\d+)?)[ \t]*%",
+    re.IGNORECASE,
+)
 
 
 def _fix_kom_duplicating_dop_chas(result: dict, order_text: str):
@@ -1736,12 +1756,26 @@ def _recover_kom_percent_if_missing(result: dict, order_text: str):
     комиссия всё равно пуста - достаём ЛЮБОЕ "N%" из текста как есть
     (_RE_BARE_PERCENT) - в этой системе "%" не означает ничего, кроме
     комиссии. Чистка предупреждений теперь ловит и GPT-шный
-    нестандартный формат "N%: ..." (было только наше "N: ...")."""
+    нестандартный формат "N%: ..." (было только наше "N: ...").
+
+    29.09: последний рубеж (голое "N%") НЕ должен хватать то же самое
+    число, которое уже отдельно ушло в "доп.услуги"
+    (_recover_dop_uslugi_kom, отдельная третья комиссия на не прописанные
+    в тарифе услуги) - иначе один и тот же процент задваивается сразу в
+    "Ком." и в "доп.услуги" (поймано тестом при разработке этого фикса).
+    Сравниваем именно по УЖЕ СОХРАНЁННОМУ значению dop_uslugi_kom_percent,
+    а не только по совпадению регэкспа - так проверка работает и когда
+    _recover_dop_uslugi_kom забрал число из GPT-шной пометки в neponyatno,
+    а не напрямую из текста."""
     if result.get("kom_avto") or result.get("kom_gruzchiki"):
         return
     m = _RE_KOM_PERCENT_GENERAL.search(order_text or "")
     if not m:
-        m = _RE_BARE_PERCENT.search(order_text or "")
+        bare_m = _RE_BARE_PERCENT.search(order_text or "")
+        dop_val = (result.get("tariff_json") or {}).get("dop_uslugi_kom_percent")
+        if bare_m and dop_val is not None and float(bare_m.group(1).replace(",", ".")) == dop_val:
+            return
+        m = bare_m
     if not m:
         return
     val = float(m.group(1).replace(",", "."))
@@ -1757,6 +1791,54 @@ def _recover_kom_percent_if_missing(result: dict, order_text: str):
             continue
         kept.append(item)
     result["neponyatno"] = kept
+
+
+def _recover_dop_uslugi_kom(result: dict, order_text: str):
+    """Реальный кейс (29.09, заказ Алексея Конюхова): текст содержал
+    '...послуги, які не прописані в тарифі то ціну узгоджуйте на місці
+    на них комісія 20%' - ОТДЕЛЬНАЯ, третья по счёту комиссия (не
+    kom_avto, не kom_gruzchiki) - специально на доп.услуги, которые ещё
+    не известны сейчас и будут согласованы на месте по факту. В этом же
+    заказе УЖЕ была обычная комиссия ('Ком 4000/1800/10' - ступенчатая,
+    корректно разобралась в kom_avto), поэтому существующий
+    _recover_kom_percent_if_missing не срабатывал (он специально бьёт
+    отбой, если kom_avto/kom_gruzchiki уже не пустые) - число "20"
+    осталось в GPT-шном нестандартном предупреждении '20%: доппослуги?'.
+
+    Подтверждено логистом-владельцем явно: 'это ком по этому заказу на
+    услуги которые не перечислены но могут возникнуть' и 'это та же ком
+    - какая разница указаны услуги или нет' - то есть это полноценная,
+    денежно значимая информация, показывать её нужно, а не прятать в
+    'не понял'. Показывается ДОПОЛНИТЕЛЬНО к обычной комиссии, в той же
+    строке "Ком." превью (build_tariff_preview), не заменяя её.
+
+    GPT для этого случая обычно САМ уже правильно определяет смысл числа
+    через свою нестандартную пометку в neponyatno ('N%: доппослуги?' -
+    формат 'N%: label', не наш обычный 'N: candidates') - её и вылавливаем
+    в первую очередь, читая именно label на слово 'послуг'. Если GPT
+    почему-то не написал вообще ничего (worst-case) - независимый
+    regex-фолбэк прямо по тексту заявки (_RE_DOP_USLUGI_KOM)."""
+    tj = result.setdefault("tariff_json", {})
+    if tj.get("dop_uslugi_kom_percent") is not None:
+        return
+
+    val = None
+    kept = []
+    for item in result.get("neponyatno") or []:
+        m = _NEPONYATNO_PERCENT_ITEM_RE.match(item)
+        if m and val is None and re.search(r"послуг", m.group(2), re.IGNORECASE):
+            val = float(m.group(1).replace(",", "."))
+            continue
+        kept.append(item)
+    result["neponyatno"] = kept
+
+    if val is None:
+        m2 = _RE_DOP_USLUGI_KOM.search(order_text or "")
+        if m2:
+            val = float(m2.group(1).replace(",", "."))
+
+    if val is not None:
+        tj["dop_uslugi_kom_percent"] = val
 
 
 def _strip_client_pays_from_kom(result: dict, order_text: str):
@@ -2653,6 +2735,7 @@ def parse_tariff_via_gpt(order_text: str) -> dict:
         _strip_bogus_gruzchiki(result, order_text)
         _strip_bogus_kom(result, order_text)
         _strip_client_pays_from_kom(result, order_text)
+        _recover_dop_uslugi_kom(result, order_text)
         _recover_kom_percent_if_missing(result, order_text)
         _strip_bogus_km(result, order_text)
         _strip_bogus_ves(result, order_text)
@@ -2758,15 +2841,30 @@ def build_tariff_preview(tariff: dict, author_line: str = "", edited_fields: set
 
     a_str, g_str = kom_str(kom_avto), kom_str(kom_gruz)
     kom_star = star(["kom_avto", "kom_gruzchiki"])
+    kom_line = None
     if a_str and g_str:
         if a_str == g_str:
-            lines.append(f"Ком. {a_str}{kom_star}")
+            kom_line = f"Ком. {a_str}"
         else:
-            lines.append(f"Ком. авто: {a_str} | грузчики: {g_str}{kom_star}")
+            kom_line = f"Ком. авто: {a_str} | грузчики: {g_str}"
     elif a_str:
-        lines.append(f"Ком. {a_str}{kom_star}")
+        kom_line = f"Ком. {a_str}"
     elif g_str:
-        lines.append(f"Ком. грузчики: {g_str}{kom_star}")
+        kom_line = f"Ком. грузчики: {g_str}"
+
+    # Отдельная, третья комиссия - на доп.услуги, которые не прописаны в
+    # тарифе и будут согласованы на месте (реальный кейс 29.09, раздел 0
+    # техдокумента, подтверждено логистом-владельцем явно: "это ком по
+    # этому заказу на услуги которые не перечислены но могут возникнуть").
+    # Дописывается К СУЩЕСТВУЮЩЕЙ строке "Ком." через запятую, а если
+    # обычной комиссии в заказе вообще нет - показывается своей строкой.
+    dop_uslugi_pct = tj.get("dop_uslugi_kom_percent")
+    if dop_uslugi_pct is not None:
+        suffix = f"доп.услуги {_fmt_num(dop_uslugi_pct)}%"
+        kom_line = f"{kom_line}, {suffix}" if kom_line else f"Ком. {suffix}"
+
+    if kom_line:
+        lines.append(f"{kom_line}{kom_star}")
 
     # Плательщик показываем ТОЛЬКО когда это реально важно: БН + платит
     # Диспетчер. Если БН, но платит Клиент (или не указано) - логист всё
