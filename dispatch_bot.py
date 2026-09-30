@@ -1397,6 +1397,21 @@ _RE_LOADER_SINGLE_RATE = re.compile(
     r"(\d+(?:[.,]\d+)?)[ \t]*(?:грн[ \t]*)?/[ \t]*(?:ч[а-яё]*|год\w*)",
     re.IGNORECASE,
 )
+# Третий вариант того же "ставка за 1 человека" формата (29.09/30.09,
+# реальный кейс "вант 400год/20") - отличается от формата Б порядком:
+# единица времени ("год"/"ч...") ПРИКЛЕЕНА СРАЗУ к ставке БЕЗ слэша
+# перед собой (как "5т"), а слэш и число идут уже ПОСЛЕ неё ("400год/20"),
+# а не "RATE/час" как в формате Б. Подтверждено логистом-владельцем:
+# ставка (400) - за 1 человека в час (та же логика 27.08 - база = RATE×2),
+# а число после слэша (20) - это НЕ доп.час, а отдельное "лишнее число"
+# ("20 это допы не доп час") - уходит в gruzchiki_dopy на общую
+# классификацию ≤14→вес/≥15→этажи+проходы (_split_gruzchiki_dopy_by_plausibility,
+# раздел 7), как и любое другое "лишнее число" у грузчиков.
+_RE_LOADER_RATE_GLUED_HOUR_WITH_EXTRA = re.compile(
+    r"(?:вантажник\w*|груз\w*|(?<![а-яіїєґ])вант(?![а-яіїєґ])|експедитор\w*|экспедитор\w*)[ \t]*:?[ \t]*"
+    r"(\d+(?:[.,]\d+)?)[ \t]*(?:ч[а-яё]*|год\w*)[ \t]*/[ \t]*(\d+(?:[.,]\d+)?)",
+    re.IGNORECASE,
+)
 
 
 def _apply_per_loader_rate_formats(result: dict, order_text: str):
@@ -1427,7 +1442,14 @@ def _apply_per_loader_rate_formats(result: dict, order_text: str):
     буквально "1 грузчик" - для другого количества с этой формулировкой
     не обобщаем, ждём отдельного подтверждения.
 
-    Оба формата - это ОТДЕЛЬНАЯ строка грузчиков (не комбинированный
+    Формат В (29.09/30.09) - "вант RATEгод/EXTRA" (единица времени
+    приклеена к ставке, слэш и число - уже после неё). RATE - та же
+    ставка за 1 человека в час, что и в формате Б (база = RATE*2), но
+    EXTRA - это НЕ доп.час, а "лишнее число" (этажи+проходы или вес по
+    общему порогу ≤14/≥15, раздел 7) - подтверждено логистом-владельцем
+    на реальном заказе (см. проектный документ).
+
+    Все три формата - это ОТДЕЛЬНАЯ строка грузчиков (не комбинированный
     тариф авто+грузчики) - поэтому применяется ПОСЛЕ
     _apply_generic_combined_avto_gruzchiki (которая на такой текст и
     так не сработает - _RE_SEPARATE_LOADERS_LINE отловит "грузчик
@@ -1458,6 +1480,26 @@ def _apply_per_loader_rate_formats(result: dict, order_text: str):
             tj["etazhi_stavka"] = extra
             used.add(_fmt_num(extra))
 
+        result["neponyatno"] = [
+            item for item in (result.get("neponyatno") or [])
+            if not (m2 := _NEPONYATNO_ITEM_RE.match(item)) or m2.group(1) not in used
+        ]
+        return
+
+    m = _RE_LOADER_RATE_GLUED_HOUR_WITH_EXTRA.search(order_text or "")
+    if m:
+        rate = float(m.group(1).replace(",", "."))
+        extra = float(m.group(2).replace(",", "."))
+        result["gruzchiki_chasov"] = 2
+        result["gruzchiki_dop_chas"] = rate
+        result["gruzchiki_baza"] = round(rate * 2, 2)
+
+        dopy = list(result.get("gruzchiki_dopy") or [])
+        if extra not in dopy:
+            dopy.append(extra)
+        result["gruzchiki_dopy"] = dopy
+
+        used = {_fmt_num(rate)}
         result["neponyatno"] = [
             item for item in (result.get("neponyatno") or [])
             if not (m2 := _NEPONYATNO_ITEM_RE.match(item)) or m2.group(1) not in used
