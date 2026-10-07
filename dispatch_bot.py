@@ -3070,18 +3070,46 @@ def build_tariff_row_values(tariff: dict) -> dict:
     }
 
 
-def write_tariff_to_sheet(sheet, row_num: int, tariff: dict, columns: list = None):
+# 07.10: заявка на несколько дней ('8.10-9.10 ...'). parsing-bot создаёт по
+# строке на каждый день: первая - с обычным ключом 'chat:msg', следующие -
+# 'chat:msg#d2', '#d3'... Превью тарифа и подтверждение - одни на заявку,
+# а в таблицу тариф пишется во ВСЕ её строки.
+MULTIDAY_MAX_DAYS = 7
+
+
+def find_extra_day_rows(sheet, order_key: str) -> list:
+    """Строки второго и следующих дней заявки (пусто для обычной заявки)."""
+    rows = []
+    for n in range(2, MULTIDAY_MAX_DAYS + 1):
+        r = find_row_by_key(sheet, f"{order_key}#d{n}")
+        if not r:
+            break
+        rows.append(r)
+    return rows
+
+
+def write_tariff_to_sheet(sheet, row_num: int, tariff: dict, columns: list = None, order_key: str = None):
     """Пишет тариф в Sheets. Если columns не задан - пишет все 11 колонок
     (используется при подтверждении ✅). Если задан список названий -
-    пишет только их (используется при точечной правке одного поля)."""
+    пишет только их (используется при точечной правке одного поля).
+    order_key задан - тариф пишется и в строки остальных дней заявки."""
     cols = ensure_tariff_columns(sheet)
     values = build_tariff_row_values(tariff)
     names = columns or TARIFF_COLUMN_NAMES
+    target_rows = [row_num]
+    if order_key:
+        try:
+            target_rows += find_extra_day_rows(sheet, order_key)
+        except Exception as e:
+            logger.warning(f"Не удалось найти строки остальных дней заявки {order_key}: {e}")
     updates = [
-        {"range": f"{col_letter(cols[name])}{row_num}", "values": [[values[name]]]}
+        {"range": f"{col_letter(cols[name])}{r}", "values": [[values[name]]]}
+        for r in target_rows
         for name in names
     ]
     sheet.batch_update(updates, value_input_option="RAW")
+    if len(target_rows) > 1:
+        logger.info(f"Тариф по key={order_key} записан в строки всех дней заявки: {target_rows}")
 
 
 # ---------------------------------------------------------------------------
@@ -3662,7 +3690,7 @@ async def handle_tariff_callback(update: Update, context: ContextTypes.DEFAULT_T
             return
         pending = get_or_reparse_tariff(sheet, row_num, order_key)
         try:
-            write_tariff_to_sheet(sheet, row_num, pending)
+            write_tariff_to_sheet(sheet, row_num, pending, order_key=order_key)
         except Exception as e:
             logger.error(f"Не удалось записать тариф в Sheets, key={order_key}: {e}")
             log_event(f"Тариф: ОШИБКА записи - {e}", row=row_num)
@@ -3723,7 +3751,7 @@ async def handle_tariff_callback(update: Update, context: ContextTypes.DEFAULT_T
                 await query.edit_message_text(query.message.text + f"\n\n⚠️ {e}")
                 return
             try:
-                write_tariff_to_sheet(sheet, row_num, pending)
+                write_tariff_to_sheet(sheet, row_num, pending, order_key=order_key)
             except Exception as e:
                 logger.error(f"Не удалось записать авто-резолв поля '{field_key}', key={order_key}: {e}")
                 await query.edit_message_text(f"⚠️ Не удалось записать в таблицу: {e}")
@@ -3791,7 +3819,7 @@ async def handle_tariff_correction_reply(update: Update, context: ContextTypes.D
         # Пишем ВЕСЬ тариф целиком, а не только тронутое поле - иначе если
         # логист правит одно поле, не дожидаясь ✅ Верно, остальные уже
         # разобранные GPT поля так и останутся пустыми в таблице.
-        write_tariff_to_sheet(sheet, row_num, pending)
+        write_tariff_to_sheet(sheet, row_num, pending, order_key=order_key)
     except Exception as e:
         logger.error(f"Не удалось записать правку поля '{field_key}' в Sheets, key={order_key}: {e}")
         await msg.reply_text(f"⚠️ Не удалось записать в таблицу: {e}")

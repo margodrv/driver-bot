@@ -1110,6 +1110,72 @@ run_case(
 )
 
 # ============================================================================
+# 32. 07.10: заявка на несколько дней ('8.10-9.10 ...') - тариф один,
+# пишется в строки всех дней ('chat:msg', 'chat:msg#d2', ...)
+# ============================================================================
+
+run_case(
+    "Заявка на два дня '8.10-9.10 12-14:00': тариф разбирается как обычно, диапазон дат не мешает",
+    order_text=(
+        "8.10-9.10 12-14:00 5т + ГБ + экспедитор \n\nТ1 Боярка , белогородская 170\n\nТ2-Т?\n\n"
+        "Тар БН авто 5500/1000/400/80 экспедитор 350\n\n+380 68 199 01 11"
+    ),
+    start_result={"avto_baza": 5500, "avto_dop_chas": 1000, "min_chasov": 3,
+                  "gruzchiki_baza": None, "gruzchiki_dop_chas": None,
+                  "tariff_json": {"prochie_dopy": [{"nazvanie": "Экспедитор", "summa": 350, "group": "avto"}]},
+                  "neponyatno": ["400: точка?/км?", "80: км?"], "forma_oplaty": "БН"},
+    must_contain=["Авто: 5500 (3ч)/1000", "Грузчики: 350 (2ч)/", "Форма оплаты: БН"],
+    must_not_contain=["Экспедитор:", "8.10", "9.10"],
+)
+
+
+def _multiday_write_test():
+    """write_tariff_to_sheet пишет тариф во все строки заявки на несколько дней."""
+    global PASSED, FAILED
+
+    class _Cell:
+        def __init__(self, row):
+            self.row = row
+
+    class _Sheet:
+        def __init__(self, keys):
+            self.keys = keys      # ключ -> номер строки
+            self.written = []
+        def find(self, key, in_column=None):
+            return _Cell(self.keys[key]) if key in self.keys else None
+        def batch_update(self, updates, value_input_option=None):
+            self.written += updates
+
+    orig_ensure = db.ensure_tariff_columns
+    db.ensure_tariff_columns = lambda sheet: {name: 29 + i for i, name in enumerate(db.TARIFF_COLUMN_NAMES)}
+    try:
+        tariff = {"avto_baza": 5500, "avto_dop_chas": 1000, "min_chasov": 3, "forma_oplaty": "БН"}
+        problems = []
+        s2 = _Sheet({"-100:700": 12, "-100:700#d2": 13})
+        db.write_tariff_to_sheet(s2, 12, tariff, order_key="-100:700")
+        rows = sorted({int("".join(ch for ch in u["range"] if ch.isdigit())) for u in s2.written})
+        if rows != [12, 13]:
+            problems.append(f"два дня: тариф записан в строки {rows}, ожидались [12, 13]")
+        s1 = _Sheet({"-100:701": 20})
+        db.write_tariff_to_sheet(s1, 20, tariff, order_key="-100:701")
+        rows = sorted({int("".join(ch for ch in u["range"] if ch.isdigit())) for u in s1.written})
+        if rows != [20]:
+            problems.append(f"обычная заявка: тариф записан в строки {rows}, ожидалась [20]")
+    finally:
+        db.ensure_tariff_columns = orig_ensure
+    name = "Заявка на несколько дней: тариф пишется во все её строки, у обычной - в одну"
+    if problems:
+        FAILED += 1
+        FAILURES.append((name, "", problems))
+        print(f"✗ {name}")
+    else:
+        PASSED += 1
+        print(f"✓ {name}")
+
+
+_multiday_write_test()
+
+# ============================================================================
 # Итог
 # ============================================================================
 
