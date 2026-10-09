@@ -639,6 +639,50 @@ _LOADER_TEXT_RE = re.compile(
 )
 
 
+# Реальный кейс (09.10): отправитель "Анна" сама подписывается в начале
+# СВОЕГО сообщения "Анна, Вантажні перевезення Київ: ..." - слово
+# "Вантажні" в названии ЕЁ ФИРМЫ ложно срабатывало в _LOADER_TEXT_RE как
+# "в заказе упомянуты грузчики", хотя в самом тарифе грузчики не
+# упоминались вообще (парсинг-бот пишет msg.text в заявку как есть,
+# имя/подпись отправителя бот туда не добавляет - значит это сам
+# отправитель так подписался).
+#
+# Эвристика: текст до первого ":" считаем "подписью" и убираем из
+# текста, который сканирует _LOADER_TEXT_RE, ТОЛЬКО если этот префикс
+# (а) не длиннее 60 символов и не содержит переноса строки (иначе это
+# не первая короткая строка-подпись, а часть обычного текста заявки -
+# например "5т + вантажники\nТариф: 5000/1000", где до ":" целая первая
+# строка с переносом), (б) не содержит цифр (иначе это дата/время в
+# начале заявки типа "1.10 9:00 5т + 4 вантажника", а не подпись-имя), и
+# (в) содержит запятую (паттерн "Имя, Название фирмы:" - подпись из
+# нескольких слов через запятую). Запятая - ключевой отличительный
+# признак: реальная тарифная строка "Вантажники: 300грн/год/..." (см.
+# регрессию 09.09 выше) - это ОДНО слово-роль перед ":", без запятой, и
+# должна продолжать считаться упоминанием грузчиков как раньше; а
+# "Анна, Вантажні перевезення Київ:" - явно "имя, запятая, название
+# фирмы" до ":", запятая отличает подпись от тарифной строки.
+_SIGNATURE_PREFIX_RE = re.compile(r"^([^\n:]{1,60}):")
+
+
+def _strip_signature_prefix(text: str) -> str:
+    """См. комментарий выше _SIGNATURE_PREFIX_RE. Возвращает text без
+    начальной подписи отправителя (если она похожа на подпись), иначе -
+    text без изменений. Используется ТОЛЬКО для проверки _LOADER_TEXT_RE
+    (упомянуты ли грузчики вообще) - не трогает текст, который видит сам
+    GPT или другие регулярки (там подпись не мешает)."""
+    if not text:
+        return text
+    m = _SIGNATURE_PREFIX_RE.match(text)
+    if not m:
+        return text
+    prefix = m.group(1)
+    if "," not in prefix:
+        return text  # без запятой - похоже на тарифную строку, не трогаем
+    if any(ch.isdigit() for ch in prefix):
+        return text
+    return text[m.end():]
+
+
 _VITALIYA_RE = re.compile(r"виталия", re.IGNORECASE)
 _SANOBROBKA_RE = re.compile(r"сан\.?\s*о?бр[оа]б", re.IGNORECASE)
 _FIVE_NUMBERS_RE = re.compile(
@@ -1294,7 +1338,7 @@ def _apply_generic_combined_avto_gruzchiki(result: dict, order_text: str):
     """
     if result.get("gruzchiki_baza") is not None:
         return  # более специфичный шаблон/GPT уже разобрался - не лезем
-    if not _LOADER_TEXT_RE.search(order_text or ""):
+    if not _LOADER_TEXT_RE.search(_strip_signature_prefix(order_text or "")):
         return  # грузчики вообще не упомянуты - обычный случай авто-only
     if _RE_SEPARATE_LOADERS_LINE.search(order_text or ""):
         return  # есть отдельная строка с ценой грузчиков - тариф раздельный
@@ -1577,6 +1621,110 @@ def _apply_vitaliya_gruzchiki_template(result: dict, order_text: str):
     ]
 
 
+# Телефон в заявке бывает как "+380XXXXXXXXX" (код страны), так и
+# "0XXXXXXXXXX" (локальный формат, 10 цифр с ведущим нулём) - возможно с
+# пробелами/дефисами внутри. Негативные lookaround на цифры по краям,
+# чтобы не выхватить середину более длинного числа.
+_RE_PHONE_CANDIDATE = re.compile(
+    r"(?<!\d)(?:\+?38)?0\d{2}[ \t-]?\d{3}[ \t-]?\d{2}[ \t-]?\d{2}(?!\d)"
+)
+
+
+def _phone_numbers_in_text(order_text: str) -> set:
+    """Возвращает номера телефонов, упомянутые в тексте заявки,
+    нормализованные до 9-значного "хвоста" (без кода страны/ведущего
+    нуля и разделителей) - чтобы "+380504201260" и "0504201260"
+    считались ОДНИМ и тем же номером при сравнении с числами тарифа."""
+    found = set()
+    for m in _RE_PHONE_CANDIDATE.finditer(order_text or ""):
+        digits = re.sub(r"\D", "", m.group(0))
+        if digits.startswith("380") and len(digits) == 12:
+            found.add(digits[3:])
+        elif digits.startswith("0") and len(digits) == 10:
+            found.add(digits[1:])
+    return found
+
+
+def _looks_like_phone(value, phones: set) -> bool:
+    """True, если числовое значение тарифа совпадает (как есть, либо с
+    добавленным/убранным ведущим нулём) с одним из номеров, найденных в
+    тексте заявки - см. _phone_numbers_in_text."""
+    if value is None or not phones:
+        return False
+    digits = re.sub(r"\D", "", _fmt_num(value))
+    if not digits:
+        return False
+    return digits in phones or digits.lstrip("0") in phones or ("0" + digits) in phones
+
+
+def _strip_phone_numbers_from_tariff(result: dict, order_text: str):
+    """КРИТИЧНАЯ защита (09.10): номер телефона НИКОГДА не может быть
+    тарифной ставкой. Реальный случай - заказ "Анна, Вантажні
+    перевезення Київ" (13.10) без единого упоминания грузчиков в самом
+    тарифе, но с контактным номером "0504201260" в тексте (контакт на
+    Т2) - GPT спутал этот номер со ставкой грузчиков и записал
+    gruzchiki_baza=504201260, из-за чего в превью появилась абсурдная
+    строка "Грузчики: 504201260 (2ч)/".
+
+    Запускается ПЕРВОЙ в цепочке (раньше любых _apply_*/_strip_* выше),
+    чтобы ни одна из них не успела "обосновать" телефонный номер под
+    видом тарифа (переименовать Авто в "Авто+грузчики" и т.п.) - см.
+    остальные защиты _strip_bogus_* ниже, этот приём им аналогичен, но
+    проверяет ВСЕ числовые поля тарифа сразу, а не одно конкретное:
+    критерий однозначный и не зависит от того, в какое поле GPT попало
+    число (авто, грузчики, км, этажи, проходы, вес, доп.точка,
+    гидроборт, допы, комиссия) - номер телефона не бывает ставкой НИ ПРИ
+    КАКИХ обстоятельствах, бизнес-неопределённости тут нет.
+    """
+    phones = _phone_numbers_in_text(order_text)
+    if not phones:
+        return
+
+    tj = result.setdefault("tariff_json", {})
+
+    if _looks_like_phone(result.get("avto_baza"), phones):
+        result["avto_baza"] = None
+    if _looks_like_phone(result.get("avto_dop_chas"), phones):
+        result["avto_dop_chas"] = None
+    if _looks_like_phone(result.get("gruzchiki_baza"), phones):
+        result["gruzchiki_baza"] = None
+    if _looks_like_phone(result.get("gruzchiki_dop_chas"), phones):
+        result["gruzchiki_dop_chas"] = None
+    result["gruzchiki_dopy"] = [
+        v for v in (result.get("gruzchiki_dopy") or []) if not _looks_like_phone(v, phones)
+    ]
+
+    for key in ("km_stavka", "etazhi_stavka", "prohody_stavka", "dop_uslugi_kom_percent"):
+        if _looks_like_phone(tj.get(key), phones):
+            tj[key] = None
+
+    for key in ("dop_tochka", "gidrobort"):
+        d = tj.get(key)
+        if d and _looks_like_phone(d.get("summa"), phones):
+            d["summa"] = None
+
+    ves = tj.get("ves")
+    if ves and _looks_like_phone(ves.get("stavka"), phones):
+        ves["stavka"] = None
+
+    tj["prochie_dopy"] = [
+        d for d in (tj.get("prochie_dopy") or []) if not _looks_like_phone(d.get("summa"), phones)
+    ]
+
+    for kom_key in ("kom_avto", "kom_gruzchiki"):
+        k = result.get(kom_key)
+        if not k:
+            continue
+        if k.get("tip") == "pochasovka":
+            if _looks_like_phone(k.get("baza"), phones):
+                k["baza"] = None
+            if _looks_like_phone(k.get("dop_chas"), phones):
+                k["dop_chas"] = None
+            k["dopy"] = [v for v in (k.get("dopy") or []) if not _looks_like_phone(v, phones)]
+        elif _looks_like_phone(k.get("znachenie"), phones):
+            k["znachenie"] = None
+
+
 def _strip_bogus_gruzchiki(result: dict, order_text: str):
     """КРИТИЧНАЯ защита: если в самом тексте заявки нет ни слова
     'вантажник', ни 'грузчик' - в заказе НЕТ грузчиков, точка. Обнаружен
@@ -1591,7 +1739,7 @@ def _strip_bogus_gruzchiki(result: dict, order_text: str):
     через кнопки (Точка/Км/ГБ и т.п.), а не остаться с придуманной
     строкой "Грузчики" в заказе, где грузчиков вообще не было.
     """
-    if _LOADER_TEXT_RE.search(order_text or ""):
+    if _LOADER_TEXT_RE.search(_strip_signature_prefix(order_text or "")):
         return  # текст явно упоминает грузчиков - ничего не трогаем
 
     stray = []
@@ -2763,6 +2911,7 @@ def parse_tariff_via_gpt(order_text: str) -> dict:
             result["tariff_json"] = {}
         if result.get("neponyatno") is None:
             result["neponyatno"] = []
+        _strip_phone_numbers_from_tariff(result, order_text)
         _apply_vitaliya_sanobrobka_template(result, order_text)
         _apply_vitaliya_gruzchiki_template(result, order_text)
         _apply_combined_avto_gruzchiki_template(result, order_text)
@@ -3070,46 +3219,18 @@ def build_tariff_row_values(tariff: dict) -> dict:
     }
 
 
-# 07.10: заявка на несколько дней ('8.10-9.10 ...'). parsing-bot создаёт по
-# строке на каждый день: первая - с обычным ключом 'chat:msg', следующие -
-# 'chat:msg#d2', '#d3'... Превью тарифа и подтверждение - одни на заявку,
-# а в таблицу тариф пишется во ВСЕ её строки.
-MULTIDAY_MAX_DAYS = 7
-
-
-def find_extra_day_rows(sheet, order_key: str) -> list:
-    """Строки второго и следующих дней заявки (пусто для обычной заявки)."""
-    rows = []
-    for n in range(2, MULTIDAY_MAX_DAYS + 1):
-        r = find_row_by_key(sheet, f"{order_key}#d{n}")
-        if not r:
-            break
-        rows.append(r)
-    return rows
-
-
-def write_tariff_to_sheet(sheet, row_num: int, tariff: dict, columns: list = None, order_key: str = None):
+def write_tariff_to_sheet(sheet, row_num: int, tariff: dict, columns: list = None):
     """Пишет тариф в Sheets. Если columns не задан - пишет все 11 колонок
     (используется при подтверждении ✅). Если задан список названий -
-    пишет только их (используется при точечной правке одного поля).
-    order_key задан - тариф пишется и в строки остальных дней заявки."""
+    пишет только их (используется при точечной правке одного поля)."""
     cols = ensure_tariff_columns(sheet)
     values = build_tariff_row_values(tariff)
     names = columns or TARIFF_COLUMN_NAMES
-    target_rows = [row_num]
-    if order_key:
-        try:
-            target_rows += find_extra_day_rows(sheet, order_key)
-        except Exception as e:
-            logger.warning(f"Не удалось найти строки остальных дней заявки {order_key}: {e}")
     updates = [
-        {"range": f"{col_letter(cols[name])}{r}", "values": [[values[name]]]}
-        for r in target_rows
+        {"range": f"{col_letter(cols[name])}{row_num}", "values": [[values[name]]]}
         for name in names
     ]
     sheet.batch_update(updates, value_input_option="RAW")
-    if len(target_rows) > 1:
-        logger.info(f"Тариф по key={order_key} записан в строки всех дней заявки: {target_rows}")
 
 
 # ---------------------------------------------------------------------------
@@ -3690,7 +3811,7 @@ async def handle_tariff_callback(update: Update, context: ContextTypes.DEFAULT_T
             return
         pending = get_or_reparse_tariff(sheet, row_num, order_key)
         try:
-            write_tariff_to_sheet(sheet, row_num, pending, order_key=order_key)
+            write_tariff_to_sheet(sheet, row_num, pending)
         except Exception as e:
             logger.error(f"Не удалось записать тариф в Sheets, key={order_key}: {e}")
             log_event(f"Тариф: ОШИБКА записи - {e}", row=row_num)
@@ -3751,7 +3872,7 @@ async def handle_tariff_callback(update: Update, context: ContextTypes.DEFAULT_T
                 await query.edit_message_text(query.message.text + f"\n\n⚠️ {e}")
                 return
             try:
-                write_tariff_to_sheet(sheet, row_num, pending, order_key=order_key)
+                write_tariff_to_sheet(sheet, row_num, pending)
             except Exception as e:
                 logger.error(f"Не удалось записать авто-резолв поля '{field_key}', key={order_key}: {e}")
                 await query.edit_message_text(f"⚠️ Не удалось записать в таблицу: {e}")
@@ -3819,7 +3940,7 @@ async def handle_tariff_correction_reply(update: Update, context: ContextTypes.D
         # Пишем ВЕСЬ тариф целиком, а не только тронутое поле - иначе если
         # логист правит одно поле, не дожидаясь ✅ Верно, остальные уже
         # разобранные GPT поля так и останутся пустыми в таблице.
-        write_tariff_to_sheet(sheet, row_num, pending, order_key=order_key)
+        write_tariff_to_sheet(sheet, row_num, pending)
     except Exception as e:
         logger.error(f"Не удалось записать правку поля '{field_key}' в Sheets, key={order_key}: {e}")
         await msg.reply_text(f"⚠️ Не удалось записать в таблицу: {e}")
